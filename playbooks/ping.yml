@@ -1,6 +1,6 @@
 ---
 - name: Ping test
-  hosts: nayatvfe1-new
+  hosts: All
   gather_facts: false
   tasks:
     - name: Ping the target hosts
