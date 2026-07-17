@@ -1,12 +1,7 @@
 ---
 - name: Ping test
-  hosts: all
+  hosts: nayatvfe1-new
   gather_facts: false
-
   tasks:
-    - name: Ping the target host
+    - name: Ping the target hosts
       ansible.builtin.ping:
-
-    - name: Show a friendly message
-      ansible.builtin.debug:
-        msg: "Pong from {{ inventory_hostname }} 🎉"
