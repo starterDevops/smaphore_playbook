@@ -1,0 +1,70 @@
+all:
+  vars:
+    ansible_port: 2002
+    ansible_user: basit.shaukat
+    ansible_python_interpreter: /usr/bin/python3
+  hosts:
+    livestream5:
+      ansible_host: 203.82.48.74
+    livestream6:
+      ansible_host: 203.99.50.70
+    nayatvfe01:
+      ansible_host: 115.186.184.197
+    nayatvfe02:
+      ansible_host: 115.186.184.198
+    nayatvfe03:
+      ansible_host: 115.186.184.199
+    nayatvfe04:
+      ansible_host: 202.165.249.244
+    nayatvfe05:
+      ansible_host: 202.165.249.246
+    nayatvfe06:
+      ansible_host: 202.165.249.248
+    nayatvfe07:
+      ansible_host: 115.186.184.200
+    livestreamfsd:
+      ansible_host: 45.115.85.134
+    livestreamfsdbkp:
+      ansible_host: 103.55.69.214
+    livestreamlhr:
+      ansible_host: 101.50.114.34
+    umairtest:
+      ansible_host: 103.55.68.202
+    nayatvfe1-new:
+      ansible_host: 203.175.74.69
+    nayatvfe2-new:
+      ansible_host: 115.186.184.178
+    nayatvbenew:
+      ansible_host: 58.65.169.84
+    nayatvbe2new:
+      ansible_host: 58.65.169.85
+    videotranscoder:
+      ansible_host: 203.99.57.198
+  children:
+    nayatvserver:
+      hosts:
+        livestream5:
+        livestream6:
+        nayatvfe01:
+        nayatvfe02:
+        nayatvfe03:
+        nayatvfe04:
+        nayatvfe05:
+        nayatvfe06:
+        nayatvfe07:
+        nayatvfe1-new:
+        nayatvfe2-new:
+        nayatvbenew:
+        nayatvbe2new:
+        videotranscoder:
+    othercitiesserver:
+      hosts:
+        livestreamfsd:
+        livestreamfsdbkp:
+        livestreamlhr:
+    OTTserver:
+      children:
+        nayatvserver:
+    othercites:
+      children:
+        othercitiesserver:
