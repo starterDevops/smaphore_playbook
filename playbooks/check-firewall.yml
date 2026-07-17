@@ -1,6 +1,6 @@
 ---
 - name: Check firewall status on nayatv servers
-  hosts: nayatvserver
+  hosts: all
   gather_facts: true
   become: true
 
