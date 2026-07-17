@@ -36,7 +36,7 @@ all:
       ansible_host: 58.65.169.84
     nayatvbe2new:
       ansible_host: 58.65.169.85
- children:
+  children:
     nayatvserver:
       hosts:
         livestream5:
