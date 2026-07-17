@@ -1,6 +1,6 @@
 ---
 - name: Ping test
-  hosts: All
+  hosts: all
   gather_facts: false
   tasks:
     - name: Ping the target hosts
