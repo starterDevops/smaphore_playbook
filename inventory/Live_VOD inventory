@@ -66,5 +66,6 @@ all:
         streambe2.nayatel.com:
         streamfe1.nayatel.com:
         streamfe2.nayatel.com:
-
-  
+    test:
+      hosts:
+        livestream5.nayatel.com
