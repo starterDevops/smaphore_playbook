@@ -9,11 +9,11 @@
 #    subnets      : comma-separated CIDRs, e.g. "10.10.0.0/24,192.168.5.32/32"
 #    ports        : comma-separated ports,  e.g. "80,443,8443"
 #    protocol     : "tcp" | "udp"
-#    request_id   : unique portal request id (also used as UFW comment tag)
+#    ticket_id   : unique portal request id (also used as UFW comment tag)
 #    comment      : human comment, e.g. "Customer ACME - ticket INC1234"
 # =============================================================================
 
-- name: "UFW rule update - request {{ request_id }}"
+- name: "UFW rule update - request {{ ticket_id }}"
   hosts: "{{ target_group }}"
   become: true
   gather_facts: true
@@ -27,9 +27,9 @@
           - subnets        is defined and subnets        | length > 0
           - ports          is defined and ports          | length > 0
           - protocol       is defined and protocol in ["tcp","udp"]
-          - request_id     is defined and request_id     | length > 0
+          - ticket_id     is defined and ticket_id     | length > 0
           - comment        is defined and comment        | length > 0
-        fail_msg: "Missing or invalid variables. Received: target_group={{ target_group | default('') }}, subnets={{ subnets | default('') }}, ports={{ ports | default('') }}, protocol={{ protocol | default('') }}, request_id={{ request_id | default('') }}"
+        fail_msg: "Missing or invalid variables. Received: target_group={{ target_group | default('') }}, subnets={{ subnets | default('') }}, ports={{ ports | default('') }}, protocol={{ protocol | default('') }}, ={{  | default('') }}"
 
     - name: Split subnets and ports into lists
       ansible.builtin.set_fact:
@@ -74,9 +74,9 @@
 
     - name: Write pre-change UFW backup
       ansible.builtin.copy:
-        dest: "/var/backups/ufw_{{ ansible_date_time.iso8601_basic_short }}_{{ request_id }}.txt"
+        dest: "/var/backups/ufw_{{ ansible_date_time.iso8601_basic_short }}_{{ ticket_id }}.txt"
         content: |
-          # UFW state BEFORE request {{ request_id }} at {{ ansible_date_time.iso8601 }}
+          # UFW state BEFORE request {{ ticket_id }} at {{ ansible_date_time.iso8601 }}
           # Host: {{ inventory_hostname }}
           # Comment: {{ comment }}
           {{ ufw_before.stdout }}
@@ -90,7 +90,7 @@
         from_ip: "{{ item.0 }}"
         to_port: "{{ item.1 }}"
         proto: "{{ protocol }}"
-        comment: "req:{{ request_id }} {{ comment | truncate(60, True, '') }}"
+        comment: "req:{{ ticket_id }} {{ comment | truncate(60, True, '') }}"
       loop: "{{ subnet_list | product(port_list) | list }}"
       register: ufw_result
 
@@ -116,7 +116,7 @@
     - name: Summarize change for the portal
       ansible.builtin.debug:
         msg:
-          request_id: "{{ request_id }}"
+          ticket_id: "{{ ticket_id }}"
           host: "{{ inventory_hostname }}"
           changed: "{{ ufw_result.changed }}"
           subnets: "{{ subnet_list }}"
