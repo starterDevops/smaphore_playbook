@@ -36,13 +36,13 @@ all:
       ansible_host: 58.65.169.84
     nayatvbe2new:
       ansible_host: 58.65.169.85
-    streambe1.nayatel.com
-      ansible_host: 172.16.179.189 
-    streambe2.nayatel.com
+    streambe1.nayatel.com:
+      ansible_host: 172.16.179.189
+    streambe2.nayatel.com:
       ansible_host: 172.16.250.34
-    streamfe1.nayatel.com
-      ansible_host: 202.165.249.211 
-    streamfe2.nayatel.com
+    streamfe1.nayatel.com:
+      ansible_host: 202.165.249.211
+    streamfe2.nayatel.com:
       ansible_host: 202.165.249.204
   children:
     nayatv_live:
@@ -68,4 +68,4 @@ all:
         streamfe2.nayatel.com:
     test:
       hosts:
-        livestream5.nayatel.com
+        livestream5:
