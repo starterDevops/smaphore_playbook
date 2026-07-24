@@ -13,13 +13,22 @@
 #    comment      : human comment, e.g. "Customer ACME - ticket INC1234"
 # =============================================================================
 
-- name: "UFW rule update - ticket {{ ticket_id }}"
+- name: "UFW rule update"
   hosts: "{{ target_group }}"
   become: true
   gather_facts: true
 
   # Fail fast if any required variable was not supplied
   pre_tasks:
+    - name: Default ticket_id if not provided
+      ansible.builtin.set_fact:
+        ticket_id: "manual-{{ ansible_date_time.iso8601_basic_short }}"
+      when: ticket_id is not defined or (ticket_id | trim | length == 0)
+
+    - name: Show the effective ticket_id
+      ansible.builtin.debug:
+        msg: "Using ticket_id: {{ ticket_id }}"
+
     - name: Validate required variables were passed
       ansible.builtin.assert:
         that:
@@ -27,9 +36,8 @@
           - subnets        is defined and subnets        | length > 0
           - ports          is defined and ports          | length > 0
           - protocol       is defined and protocol in ["tcp","udp"]
-          - ticket_id      is defined and ticket_id      | length > 0
           - comment        is defined and comment        | length > 0
-        fail_msg: "Missing or invalid variables. Received: target_group={{ target_group | default('') }}, subnets={{ subnets | default('') }}, ports={{ ports | default('') }}, protocol={{ protocol | default('') }}, ticket_id={{ ticket_id | default('') }}, comment={{ comment | default('') }}"
+        fail_msg: "Missing or invalid variables. Received: target_group={{ target_group | default('') }}, subnets={{ subnets | default('') }}, ports={{ ports | default('') }}, protocol={{ protocol | default('') }}, comment={{ comment | default('') }}"
 
     - name: Split subnets and ports into lists
       ansible.builtin.set_fact:
