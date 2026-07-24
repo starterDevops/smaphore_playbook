@@ -20,10 +20,19 @@
 
   # Fail fast if any required variable was not supplied
   pre_tasks:
+    - name: Trim whitespace from all inputs
+      ansible.builtin.set_fact:
+        target_group: "{{ target_group | default('') | trim }}"
+        subnets:      "{{ subnets      | default('') | trim }}"
+        ports:        "{{ ports        | default('') | trim }}"
+        protocol:     "{{ protocol     | default('') | trim | lower }}"
+        comment:      "{{ comment      | default('') | trim }}"
+        ticket_id:    "{{ ticket_id    | default('') | trim }}"
+
     - name: Default ticket_id if not provided
       ansible.builtin.set_fact:
         ticket_id: "manual-{{ ansible_date_time.iso8601_basic_short }}"
-      when: ticket_id is not defined or (ticket_id | trim | length == 0)
+      when: ticket_id | length == 0
 
     - name: Show the effective ticket_id
       ansible.builtin.debug:
@@ -37,7 +46,7 @@
           - ports          is defined and ports          | length > 0
           - protocol       is defined and protocol in ["tcp","udp"]
           - comment        is defined and comment        | length > 0
-        fail_msg: "Missing or invalid variables. Received: target_group={{ target_group | default('') }}, subnets={{ subnets | default('') }}, ports={{ ports | default('') }}, protocol={{ protocol | default('') }}, comment={{ comment | default('') }}"
+        fail_msg: "Missing or invalid variables. Received: target_group='{{ target_group | default('') }}', subnets='{{ subnets | default('') }}', ports='{{ ports | default('') }}', protocol='{{ protocol | default('') }}', comment='{{ comment | default('') }}'"
 
     - name: Split subnets and ports into lists
       ansible.builtin.set_fact:
