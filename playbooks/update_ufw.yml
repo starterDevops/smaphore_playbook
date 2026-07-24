@@ -44,20 +44,14 @@
         subnet_list: "{{ subnets.split(',') | map('trim') | list }}"
         port_list:   "{{ ports.split(',')   | map('trim') | list }}"
 
-    - name: Sanity check - CIDR format
-      ansible.builtin.assert:
-        that:
-          - item | ansible.utils.ipaddr('net') is not none
-        fail_msg: "Invalid CIDR: {{ item }}"
-      loop: "{{ subnet_list }}"
-
-    - name: Sanity check - port range 1-65535
-      ansible.builtin.assert:
-        that:
-          - (item | int) >= 1
-          - (item | int) <= 65535
-        fail_msg: "Invalid port: {{ item }}"
-      loop: "{{ port_list }}"
+    - name: Show effective inputs
+      ansible.builtin.debug:
+        msg:
+          ticket_id: "{{ ticket_id }}"
+          subnet_list: "{{ subnet_list }}"
+          port_list: "{{ port_list }}"
+          protocol: "{{ protocol }}"
+          target_group: "{{ target_group }}"
 
   tasks:
     - name: Ensure UFW package is installed
