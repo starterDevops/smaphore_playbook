@@ -1,0 +1,245 @@
+---
+# =============================================================================
+#  inspect_ssl.yml
+#  Read-only discovery playbook. Reports the current SSL configuration on
+#  target hosts across supported services (Apache, Nginx, Nimble Streamer).
+#
+#  This playbook makes NO changes. It's safe to run at any time on any host.
+#
+#  Extra vars (passed by Semaphore Survey / API):
+#    target_group   : Ansible group name to inspect (e.g. "vod", "test")
+#    services       : Comma-separated list: "apache,nginx,nimble" or subset
+#    request_id     : Portal request ID (used only for log tagging)
+#
+#  Output:
+#    Structured JSON in the task output that the portal parses.
+# =============================================================================
+
+- name: "SSL config inspection"
+  hosts: "{{ target_group }}"
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Normalize inputs (trim + lowercase where appropriate)
+      ansible.builtin.set_fact:
+        target_group:  "{{ target_group  | default('')  | trim }}"
+        services:      "{{ services      | default('')  | trim | lower }}"
+        request_id:    "{{ request_id    | default('inspect-' + ansible_date_time.iso8601_basic_short) | trim }}"
+
+    - name: Split services into list
+      ansible.builtin.set_fact:
+        services_list: "{{ services.split(',') | map('trim') | select | list }}"
+
+    - name: Validate at least one supported service was requested
+      ansible.builtin.assert:
+        that:
+          - services_list | length > 0
+          - services_list | difference(['apache','nginx','nimble']) | length == 0
+        fail_msg: "services must be one or more of: apache, nginx, nimble. Received: {{ services }}"
+
+    - name: Initialize findings container
+      ansible.builtin.set_fact:
+        ssl_findings:
+          host: "{{ inventory_hostname }}"
+          request_id: "{{ request_id }}"
+          services_requested: "{{ services_list }}"
+          apache: []
+          nginx: []
+          nimble: []
+
+  tasks:
+
+    # -------------------------------------------------------------------- #
+    # APACHE INSPECTION
+    # -------------------------------------------------------------------- #
+    - name: Apache - detect if installed
+      ansible.builtin.stat:
+        path: /etc/apache2/sites-enabled
+      register: apache_dir
+      when: "'apache' in services_list"
+
+    - name: Apache - list enabled site config files
+      ansible.builtin.find:
+        paths: /etc/apache2/sites-enabled
+        patterns: "*.conf"
+        file_type: any        # symlinks are what sites-enabled typically contains
+      register: apache_enabled
+      when: "'apache' in services_list and apache_dir.stat.exists"
+
+    - name: Apache - resolve symlinks to real config paths
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+      loop: "{{ apache_enabled.files | default([]) }}"
+      register: apache_resolved
+      when: "'apache' in services_list and apache_dir.stat.exists"
+
+    - name: Apache - read the actual config file contents
+      ansible.builtin.slurp:
+        src: "{{ item.stat.lnk_source | default(item.stat.path) }}"
+      loop: "{{ apache_resolved.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      register: apache_contents
+      when: "'apache' in services_list and apache_dir.stat.exists"
+      failed_when: false      # tolerate unreadable files
+
+    - name: Apache - parse SSL directives from each config
+      ansible.builtin.set_fact:
+        apache_findings: "{{ apache_findings | default([]) + [_parsed] }}"
+      loop: "{{ apache_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item.path }}"
+      vars:
+        _content: "{{ (item.content | b64decode) if (item.content is defined) else '' }}"
+        _has_ssl: "{{ 'SSLCertificateFile' in _content }}"
+        _parsed:
+          config_path: "{{ item.item.item.path }}"
+          real_path:   "{{ item.item.stat.lnk_source | default(item.item.stat.path) }}"
+          has_ssl:     "{{ _has_ssl }}"
+          raw_lines_cert:  "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateFile') | list }}"
+          raw_lines_key:   "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateKeyFile') | list }}"
+          raw_lines_chain: "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateChainFile') | list }}"
+          raw_server_names: "{{ _content.split('\n') | select('search', '^\\s*ServerName') | list }}"
+          raw_vhost_starts: "{{ _content.split('\n') | select('search', '<VirtualHost.*:443') | list }}"
+      when: "'apache' in services_list and item.content is defined"
+
+    - name: Apache - inspect current cert expiry for each SSLCertificateFile found
+      ansible.builtin.command: >
+        openssl x509 -in {{ _cert_path }} -noout -dates -subject -issuer -fingerprint -sha256
+      loop: "{{ (apache_findings | default([])) | map(attribute='raw_lines_cert') | list | flatten }}"
+      loop_control:
+        label: "{{ _cert_path }}"
+      vars:
+        _cert_path: "{{ item | regex_replace('^\\s*SSLCertificateFile\\s+', '') | trim }}"
+      register: apache_cert_info
+      when: "'apache' in services_list and item is defined and item | trim | length > 0"
+      changed_when: false
+      failed_when: false
+
+    - name: Apache - assemble findings
+      ansible.builtin.set_fact:
+        ssl_findings: "{{ ssl_findings | combine({'apache': apache_findings | default([])}) }}"
+      when: "'apache' in services_list"
+
+    # -------------------------------------------------------------------- #
+    # NGINX INSPECTION
+    # -------------------------------------------------------------------- #
+    - name: Nginx - detect if installed
+      ansible.builtin.stat:
+        path: /etc/nginx/sites-enabled
+      register: nginx_dir
+      when: "'nginx' in services_list"
+
+    - name: Nginx - also check conf.d
+      ansible.builtin.stat:
+        path: /etc/nginx/conf.d
+      register: nginx_confd
+      when: "'nginx' in services_list"
+
+    - name: Nginx - list config files
+      ansible.builtin.find:
+        paths:
+          - /etc/nginx/sites-enabled
+          - /etc/nginx/conf.d
+        patterns: "*.conf"
+        file_type: any
+      register: nginx_configs
+      when: "'nginx' in services_list and (nginx_dir.stat.exists or nginx_confd.stat.exists)"
+
+    - name: Nginx - resolve and read
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ nginx_configs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: nginx_contents
+      when: "'nginx' in services_list and nginx_configs is defined"
+      failed_when: false
+
+    - name: Nginx - parse SSL directives
+      ansible.builtin.set_fact:
+        nginx_findings: "{{ nginx_findings | default([]) + [_parsed] }}"
+      loop: "{{ nginx_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path }}"
+      vars:
+        _content: "{{ (item.content | b64decode) if (item.content is defined) else '' }}"
+        _has_ssl: "{{ 'ssl_certificate ' in _content or 'ssl_certificate\t' in _content }}"
+        _parsed:
+          config_path: "{{ item.item.path }}"
+          has_ssl: "{{ _has_ssl }}"
+          raw_lines_cert:  "{{ _content.split('\n') | select('search', '^\\s*ssl_certificate\\s') | list }}"
+          raw_lines_key:   "{{ _content.split('\n') | select('search', '^\\s*ssl_certificate_key\\s') | list }}"
+          raw_lines_trust: "{{ _content.split('\n') | select('search', '^\\s*ssl_trusted_certificate\\s') | list }}"
+          raw_server_names: "{{ _content.split('\n') | select('search', '^\\s*server_name\\s') | list }}"
+      when: "'nginx' in services_list and item.content is defined"
+
+    - name: Nginx - inspect cert expiry
+      ansible.builtin.command: >
+        openssl x509 -in {{ _cert_path }} -noout -dates -subject -issuer -fingerprint -sha256
+      loop: "{{ (nginx_findings | default([])) | map(attribute='raw_lines_cert') | list | flatten }}"
+      loop_control:
+        label: "{{ _cert_path }}"
+      vars:
+        _cert_path: "{{ item | regex_replace('^\\s*ssl_certificate\\s+', '') | regex_replace(';\\s*$', '') | trim }}"
+      register: nginx_cert_info
+      when: "'nginx' in services_list and item is defined and item | trim | length > 0"
+      changed_when: false
+      failed_when: false
+
+    - name: Nginx - assemble findings
+      ansible.builtin.set_fact:
+        ssl_findings: "{{ ssl_findings | combine({'nginx': nginx_findings | default([])}) }}"
+      when: "'nginx' in services_list"
+
+    # -------------------------------------------------------------------- #
+    # NIMBLE INSPECTION
+    # -------------------------------------------------------------------- #
+    - name: Nimble - detect config
+      ansible.builtin.stat:
+        path: /etc/nimble/nimble.conf
+      register: nimble_conf
+      when: "'nimble' in services_list"
+
+    - name: Nimble - read config
+      ansible.builtin.slurp:
+        src: /etc/nimble/nimble.conf
+      register: nimble_content
+      when: "'nimble' in services_list and nimble_conf.stat.exists"
+      failed_when: false
+
+    - name: Nimble - parse
+      ansible.builtin.set_fact:
+        nimble_findings:
+          - config_path: /etc/nimble/nimble.conf
+            has_ssl: "{{ 'ssl_certificate' in (nimble_content.content | b64decode) }}"
+            raw_lines_cert: "{{ (nimble_content.content | b64decode).split('\n') | select('search', '^\\s*ssl_certificate\\s*=') | list }}"
+            raw_lines_key:  "{{ (nimble_content.content | b64decode).split('\n') | select('search', '^\\s*ssl_certificate_key\\s*=') | list }}"
+      when: "'nimble' in services_list and nimble_content is defined and nimble_content.content is defined"
+
+    - name: Nimble - inspect cert expiry
+      ansible.builtin.command: >
+        openssl x509 -in {{ _cert_path }} -noout -dates -subject -issuer -fingerprint -sha256
+      loop: "{{ (nimble_findings | default([])) | map(attribute='raw_lines_cert') | list | flatten }}"
+      loop_control:
+        label: "{{ _cert_path }}"
+      vars:
+        _cert_path: "{{ item | regex_replace('^\\s*ssl_certificate\\s*=\\s*', '') | trim }}"
+      register: nimble_cert_info
+      when: "'nimble' in services_list and item is defined and item | trim | length > 0"
+      changed_when: false
+      failed_when: false
+
+    - name: Nimble - assemble findings
+      ansible.builtin.set_fact:
+        ssl_findings: "{{ ssl_findings | combine({'nimble': nimble_findings | default([])}) }}"
+      when: "'nimble' in services_list"
+
+  post_tasks:
+    - name: Emit structured JSON findings for portal to parse
+      ansible.builtin.debug:
+        msg: |
+          SSL_INSPECT_RESULT_BEGIN
+          {{ ssl_findings | to_json }}
+          SSL_INSPECT_RESULT_END
