@@ -72,3 +72,5 @@ all:
     test2:
       hosts:
         nayatvfe07:
+        nayatvfe06:
+        livestream5: 
