@@ -71,6 +71,10 @@ all:
         livestream5:
     test2:
       hosts:
-        nayatvfe07:
-        nayatvfe06:
-        livestream5: 
+        nayatvfe1-new:
+        nayatvfe2-new:
+        nayatvfe01:
+        nayatvfe02:
+        nayatvfe03:
+        nayatvfe04:
+        nayatvfe05:
