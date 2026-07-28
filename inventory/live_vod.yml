@@ -44,6 +44,8 @@ all:
       ansible_host: 202.165.249.211
     streamfe2.nayatel.com:
       ansible_host: 202.165.249.204
+    umairtest: 
+      ansible_host: 101.50.83.111
   children:
     nayatv_live:
       hosts:
@@ -78,3 +80,6 @@ all:
         nayatvfe03:
         nayatvfe04:
         nayatvfe05:
+    test3:
+      hosts:
+        umairtest:
