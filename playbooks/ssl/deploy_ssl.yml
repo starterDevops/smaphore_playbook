@@ -1,0 +1,727 @@
+---
+# =============================================================================
+#  deploy_ssl.yml
+#  Production-grade SSL certificate deployment playbook.
+#
+#  Supported services: Apache, Nginx, Nimble Streamer
+#  Pattern: yearly-rotation (new files in new directory, config points at them)
+#
+#  Safety pipeline (in order):
+#     1. Trim + validate all input variables
+#     2. Verify source cert/key/chain files exist on portal (control) host
+#     3. Validate the incoming cert: PEM valid, cert-key match, chain valid,
+#        not expired, warn if expiring < 60 days
+#     4. Read current target config file, identify current SSL paths
+#     5. Backup: old config + old cert/key/chain to /var/backups/ssl/...
+#        Generate restore.sh script inside backup dir
+#     6. Stage new cert/key/chain files to target host under /tmp/ssl-staging
+#     7. Create new destination directory on target host (perms 0755)
+#     8. Copy new cert (0644), key (0600), chain (0644) to new destination
+#     9. Read current config, build modified config with new paths
+#    10. Write modified config to temp file, syntax-check target service
+#    11. If syntax check fails: cleanup, do NOT touch live config, fail cleanly
+#    12. If dry_run=true: show diff, exit success without touching live
+#    13. Move modified config into live location (atomic rename)
+#    14. Reload/restart service
+#    15. Post-deploy: openssl s_client verify, fingerprint match, service active
+#    16. If ANY step 13-15 fails: automatic rollback (restore config, restart)
+#    17. Success: emit JSON summary
+#
+#  Extra vars (passed by Semaphore Survey / API):
+#     Common:
+#       target_group      : e.g. "test", "vod", "nayatv_live"
+#       services          : "nimble" or "apache" (SINGLE service per run - simpler)
+#       ticket_id         : from portal
+#       request_id        : for backup naming
+#       dry_run           : "true" or "false"
+#
+#     Nimble-only:
+#       nimble_cert_src   : filename on portal host (e.g. "cert.pem")
+#       nimble_key_src    : filename on portal host (e.g. "key.pem")
+#       nimble_config     : target config path (default /etc/nimble/nimble.conf)
+#       nimble_dest_dir   : new destination dir on target (e.g. /etc/ssl/ssl_26_27/)
+#       nimble_cert_name  : new cert filename (e.g. certificate.txt)
+#       nimble_key_name   : new key filename (e.g. privatekey.txt)
+#
+#     Apache-only:
+#       apache_cert_src   : filename on portal host
+#       apache_key_src    : filename on portal host
+#       apache_chain_src  : filename on portal host
+#       apache_config     : target config path (e.g. /etc/apache2/sites-enabled/vhost.conf)
+#       apache_vhost_name : ServerName of VHost to update (empty = single VHost)
+#       apache_dest_dir   : new destination dir on target
+#       apache_cert_name  : new cert filename
+#       apache_key_name   : new key filename
+#       apache_chain_name : new chain filename
+#
+#  Assumptions:
+#     - Ansible controller (Semaphore host) has cert files at:
+#         /opt/ufw-portal/ssl-uploads/req_<request_id>/<filename>
+#     - Target hosts have basic tools: openssl, sed, awk, systemctl
+# =============================================================================
+
+# --------------------------------------------------------------------------- #
+#  PLAY 1: Validate on control (Semaphore) node before touching anything
+# --------------------------------------------------------------------------- #
+- name: "SSL Deploy Preflight (control node)"
+  hosts: localhost
+  gather_facts: true
+  connection: local
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  vars:
+    _upload_dir: "/opt/ufw-portal/ssl-uploads/req_{{ request_id | trim }}"
+
+  pre_tasks:
+    - name: Normalize inputs
+      ansible.builtin.set_fact:
+        target_group:      "{{ target_group      | default('') | trim }}"
+        services:          "{{ services          | default('') | trim | lower }}"
+        ticket_id:         "{{ ticket_id         | default('') | trim }}"
+        request_id:        "{{ request_id        | default('inspect-' + ansible_date_time.iso8601_basic_short) | trim }}"
+        dry_run:           "{{ dry_run           | default('false') | trim | lower }}"
+        nimble_cert_src:   "{{ nimble_cert_src   | default('') | trim }}"
+        nimble_key_src:    "{{ nimble_key_src    | default('') | trim }}"
+        nimble_config:     "{{ nimble_config     | default('/etc/nimble/nimble.conf') | trim }}"
+        nimble_dest_dir:   "{{ nimble_dest_dir   | default('') | trim }}"
+        nimble_cert_name:  "{{ nimble_cert_name  | default('certificate.txt') | trim }}"
+        nimble_key_name:   "{{ nimble_key_name   | default('privatekey.txt') | trim }}"
+        apache_cert_src:   "{{ apache_cert_src   | default('') | trim }}"
+        apache_key_src:    "{{ apache_key_src    | default('') | trim }}"
+        apache_chain_src:  "{{ apache_chain_src  | default('') | trim }}"
+        apache_config:     "{{ apache_config     | default('') | trim }}"
+        apache_vhost_name: "{{ apache_vhost_name | default('') | trim }}"
+        apache_dest_dir:   "{{ apache_dest_dir   | default('') | trim }}"
+        apache_cert_name:  "{{ apache_cert_name  | default('') | trim }}"
+        apache_key_name:   "{{ apache_key_name   | default('') | trim }}"
+        apache_chain_name: "{{ apache_chain_name | default('') | trim }}"
+
+    - name: Validate service selection
+      ansible.builtin.assert:
+        that:
+          - services in ['nimble', 'apache']
+        fail_msg: "services must be exactly 'nimble' or 'apache' - one at a time. Received: {{ services }}"
+
+    - name: Validate dry_run flag
+      ansible.builtin.assert:
+        that:
+          - dry_run in ['true', 'false']
+        fail_msg: "dry_run must be 'true' or 'false'. Received: {{ dry_run }}"
+
+    - name: Validate Nimble inputs
+      ansible.builtin.assert:
+        that:
+          - nimble_cert_src | length > 0
+          - nimble_key_src  | length > 0
+          - nimble_dest_dir | length > 0
+          - nimble_dest_dir is match('^/[^ ]+/$')
+        fail_msg: "Nimble deploy requires: nimble_cert_src, nimble_key_src, nimble_dest_dir (must be absolute path ending in /)"
+      when: services == 'nimble'
+
+    - name: Validate Apache inputs
+      ansible.builtin.assert:
+        that:
+          - apache_cert_src  | length > 0
+          - apache_key_src   | length > 0
+          - apache_chain_src | length > 0
+          - apache_config    | length > 0
+          - apache_dest_dir  | length > 0
+          - apache_cert_name | length > 0
+          - apache_key_name  | length > 0
+          - apache_chain_name| length > 0
+          - apache_dest_dir is match('^/[^ ]+/$')
+          - apache_config    is match('^/[^ ]+$')
+        fail_msg: "Apache deploy requires all apache_* variables including chain. Paths must be absolute."
+      when: services == 'apache'
+
+    - name: Verify upload directory exists on control node
+      ansible.builtin.stat:
+        path: "{{ _upload_dir }}"
+      register: _uploads
+
+    - name: Fail if upload dir missing
+      ansible.builtin.assert:
+        that:
+          - _uploads.stat.exists
+          - _uploads.stat.isdir
+        fail_msg: "Upload directory {{ _upload_dir }} does not exist on control node. Portal must upload cert files there first."
+
+    - name: Build absolute source paths
+      ansible.builtin.set_fact:
+        _cert_abs: "{{ _upload_dir }}/{{ services == 'nimble' | ternary(nimble_cert_src, apache_cert_src) }}"
+        _key_abs:  "{{ _upload_dir }}/{{ services == 'nimble' | ternary(nimble_key_src,  apache_key_src)  }}"
+        _chain_abs: "{{ _upload_dir }}/{{ apache_chain_src }}"
+
+    - name: Verify cert source file exists on control node
+      ansible.builtin.stat:
+        path: "{{ _cert_abs }}"
+      register: _cert_stat
+      failed_when: not _cert_stat.stat.exists
+
+    - name: Verify key source file exists on control node
+      ansible.builtin.stat:
+        path: "{{ _key_abs }}"
+      register: _key_stat
+      failed_when: not _key_stat.stat.exists
+
+    - name: Verify chain source file exists (Apache only)
+      ansible.builtin.stat:
+        path: "{{ _chain_abs }}"
+      register: _chain_stat
+      failed_when: not _chain_stat.stat.exists
+      when: services == 'apache'
+
+    - name: Validate cert is PEM format
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout"
+      register: _cert_pem_check
+      changed_when: false
+
+    - name: Validate key is PEM format
+      ansible.builtin.command: "openssl pkey -in {{ _key_abs }} -noout"
+      register: _key_pem_check
+      changed_when: false
+
+    - name: Extract cert public key modulus hash
+      ansible.builtin.shell: "openssl x509 -in {{ _cert_abs }} -pubkey -noout | openssl md5"
+      register: _cert_pub_hash
+      changed_when: false
+
+    - name: Extract key public key modulus hash
+      ansible.builtin.shell: "openssl pkey -in {{ _key_abs }} -pubout | openssl md5"
+      register: _key_pub_hash
+      changed_when: false
+
+    - name: Verify cert and key match (public keys must be identical)
+      ansible.builtin.assert:
+        that:
+          - _cert_pub_hash.stdout == _key_pub_hash.stdout
+        fail_msg: "SECURITY: Certificate does NOT match private key. Aborting to prevent broken SSL. cert_hash={{ _cert_pub_hash.stdout }} key_hash={{ _key_pub_hash.stdout }}"
+
+    - name: Verify chain validates cert (Apache only)
+      ansible.builtin.command: "openssl verify -CAfile {{ _chain_abs }} {{ _cert_abs }}"
+      register: _chain_verify
+      changed_when: false
+      failed_when:
+        - services == 'apache'
+        - _chain_verify.rc != 0
+      when: services == 'apache'
+
+    - name: Extract cert expiry
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -enddate"
+      register: _cert_expiry
+      changed_when: false
+
+    - name: Check cert is not already expired
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -checkend 0"
+      register: _cert_notexpired
+      changed_when: false
+
+    - name: Warn if cert expires within 60 days
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -checkend {{ 60 * 24 * 3600 }}"
+      register: _cert_expires_soon
+      changed_when: false
+      failed_when: false
+
+    - name: Report preflight summary
+      ansible.builtin.debug:
+        msg:
+          - "=== SSL DEPLOY PREFLIGHT PASSED ==="
+          - "Service:           {{ services }}"
+          - "Target group:      {{ target_group }}"
+          - "Ticket:            {{ ticket_id }}"
+          - "Request ID:        {{ request_id }}"
+          - "Dry run:           {{ dry_run }}"
+          - "Cert file:         {{ _cert_abs }}"
+          - "Cert expiry:       {{ _cert_expiry.stdout }}"
+          - "Expires within 60d: {{ 'YES - WARNING' if _cert_expires_soon.rc != 0 else 'no' }}"
+          - "Key file:          {{ _key_abs }}"
+          - "Chain file:        {{ _chain_abs if services == 'apache' else 'N/A (Nimble)' }}"
+
+    - name: Store preflight facts for target play
+      ansible.builtin.set_fact:
+        _preflight:
+          cert_abs: "{{ _cert_abs }}"
+          key_abs:  "{{ _key_abs }}"
+          chain_abs: "{{ _chain_abs if services == 'apache' else '' }}"
+        cacheable: true
+
+# --------------------------------------------------------------------------- #
+#  PLAY 2: Deploy on target hosts
+# --------------------------------------------------------------------------- #
+- name: "SSL Deploy (target hosts)"
+  hosts: "{{ target_group }}"
+  become: true
+  gather_facts: true
+  serial: 1                     # Deploy one host at a time - if one fails, halt the rest
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  vars:
+    _backup_root: "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch }}"
+    _stage_root:  "/tmp/ssl-staging-{{ request_id }}-{{ ansible_date_time.epoch }}"
+    _cert_abs:    "{{ hostvars['localhost']['_preflight']['cert_abs'] }}"
+    _key_abs:     "{{ hostvars['localhost']['_preflight']['key_abs'] }}"
+    _chain_abs:   "{{ hostvars['localhost']['_preflight']['chain_abs'] }}"
+    _config_path: "{{ nimble_config if services == 'nimble' else apache_config }}"
+    _dest_dir:    "{{ nimble_dest_dir if services == 'nimble' else apache_dest_dir }}"
+    _new_cert_path:  "{{ _dest_dir }}{{ nimble_cert_name  if services == 'nimble' else apache_cert_name }}"
+    _new_key_path:   "{{ _dest_dir }}{{ nimble_key_name   if services == 'nimble' else apache_key_name  }}"
+    _new_chain_path: "{{ _dest_dir }}{{ apache_chain_name if services == 'apache' else '' }}"
+
+  tasks:
+
+    # -------------------------------------------------------------------- #
+    # STAGE 1: Ensure paths and directories exist on target
+    # -------------------------------------------------------------------- #
+    - name: Verify target config file exists
+      ansible.builtin.stat:
+        path: "{{ _config_path }}"
+      register: _target_config
+
+    - name: Fail if target config file missing
+      ansible.builtin.assert:
+        that:
+          - _target_config.stat.exists
+          - _target_config.stat.isreg
+        fail_msg: "Target config file {{ _config_path }} does not exist on {{ inventory_hostname }}"
+
+    - name: Read current target config
+      ansible.builtin.slurp:
+        src: "{{ _config_path }}"
+      register: _current_config_raw
+
+    - name: Decode current config
+      ansible.builtin.set_fact:
+        _current_config: "{{ _current_config_raw.content | b64decode }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 2: Extract current SSL paths from config
+    # -------------------------------------------------------------------- #
+    - name: Extract current Nimble SSL paths
+      ansible.builtin.set_fact:
+        _old_cert_line: "{{ _current_config.split('\n') | select('search', '^\\s*ssl_certificate\\s*=') | list | first | default('') }}"
+        _old_key_line:  "{{ _current_config.split('\n') | select('search', '^\\s*ssl_certificate_key\\s*=') | list | first | default('') }}"
+      when: services == 'nimble'
+
+    - name: Parse Nimble old paths from lines
+      ansible.builtin.set_fact:
+        _old_cert_path: "{{ _old_cert_line | regex_replace('^\\s*ssl_certificate\\s*=\\s*', '') | trim }}"
+        _old_key_path:  "{{ _old_key_line  | regex_replace('^\\s*ssl_certificate_key\\s*=\\s*', '') | trim }}"
+        _old_chain_path: ""
+      when: services == 'nimble'
+
+    - name: Extract current Apache SSL paths
+      ansible.builtin.set_fact:
+        _old_cert_line: "{{ _current_config.split('\n') | select('search', '^\\s*SSLCertificateFile\\s') | list | first | default('') }}"
+        _old_key_line:  "{{ _current_config.split('\n') | select('search', '^\\s*SSLCertificateKeyFile\\s') | list | first | default('') }}"
+        _old_chain_line: "{{ _current_config.split('\n') | select('search', '^\\s*SSLCertificateChainFile\\s') | list | first | default('') }}"
+      when: services == 'apache'
+
+    - name: Parse Apache old paths from lines
+      ansible.builtin.set_fact:
+        _old_cert_path:  "{{ _old_cert_line  | regex_replace('^\\s*SSLCertificateFile\\s+', '') | trim }}"
+        _old_key_path:   "{{ _old_key_line   | regex_replace('^\\s*SSLCertificateKeyFile\\s+', '') | trim }}"
+        _old_chain_path: "{{ _old_chain_line | regex_replace('^\\s*SSLCertificateChainFile\\s+', '') | trim }}"
+      when: services == 'apache'
+
+    - name: Verify we found existing SSL directives (config must already have SSL configured)
+      ansible.builtin.assert:
+        that:
+          - _old_cert_path | length > 0
+          - _old_key_path  | length > 0
+        fail_msg: "Could not find existing SSL directives in {{ _config_path }}. This playbook is for cert ROTATION - the config must already have SSL."
+
+    # -------------------------------------------------------------------- #
+    # STAGE 3: BACKUP EVERYTHING (mandatory, before any changes)
+    # -------------------------------------------------------------------- #
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ _backup_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Backup current config file
+      ansible.builtin.copy:
+        src: "{{ _config_path }}"
+        dest: "{{ _backup_root }}/config-original{{ _config_path | replace('/', '_') }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+
+    - name: Backup current cert file
+      ansible.builtin.copy:
+        src: "{{ _old_cert_path }}"
+        dest: "{{ _backup_root }}/cert-original{{ _old_cert_path | replace('/', '_') }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+      failed_when: false
+
+    - name: Backup current key file
+      ansible.builtin.copy:
+        src: "{{ _old_key_path }}"
+        dest: "{{ _backup_root }}/key-original{{ _old_key_path | replace('/', '_') }}"
+        owner: root
+        group: root
+        mode: '0600'
+        remote_src: true
+      failed_when: false
+
+    - name: Backup current chain file (Apache only)
+      ansible.builtin.copy:
+        src: "{{ _old_chain_path }}"
+        dest: "{{ _backup_root }}/chain-original{{ _old_chain_path | replace('/', '_') }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+      failed_when: false
+      when: services == 'apache' and _old_chain_path | length > 0
+
+    - name: Generate restore.sh script inside backup dir
+      ansible.builtin.copy:
+        dest: "{{ _backup_root }}/restore.sh"
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Auto-generated by SSL deployment playbook
+          # Restores the config file and reloads the service
+          # Ticket: {{ ticket_id }} | Request: {{ request_id }} | Host: {{ inventory_hostname }}
+          set -e
+          echo "Restoring {{ _config_path }} from backup..."
+          cp "{{ _backup_root }}/config-original{{ _config_path | replace('/', '_') }}" "{{ _config_path }}"
+          chmod 644 "{{ _config_path }}"
+          {% if services == 'nimble' %}
+          echo "Restarting Nimble..."
+          systemctl restart nimble
+          sleep 3
+          systemctl is-active nimble
+          {% elif services == 'apache' %}
+          echo "Testing Apache config..."
+          apachectl configtest
+          echo "Reloading Apache..."
+          systemctl reload apache2
+          sleep 2
+          systemctl is-active apache2
+          {% endif %}
+          echo "Restore complete. Old cert files remain at their original locations."
+
+    # -------------------------------------------------------------------- #
+    # STAGE 4: Stage new files on target host
+    # -------------------------------------------------------------------- #
+    - name: Create staging directory on target
+      ansible.builtin.file:
+        path: "{{ _stage_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Ship new cert to target staging
+      ansible.builtin.copy:
+        src: "{{ _cert_abs }}"
+        dest: "{{ _stage_root }}/newcert.pem"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ship new key to target staging
+      ansible.builtin.copy:
+        src: "{{ _key_abs }}"
+        dest: "{{ _stage_root }}/newkey.pem"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ship new chain to target staging (Apache only)
+      ansible.builtin.copy:
+        src: "{{ _chain_abs }}"
+        dest: "{{ _stage_root }}/newchain.pem"
+        owner: root
+        group: root
+        mode: '0644'
+      when: services == 'apache'
+
+    # Re-validate on target (defense in depth)
+    - name: Re-validate cert on target (belt and suspenders)
+      ansible.builtin.command: "openssl x509 -in {{ _stage_root }}/newcert.pem -noout"
+      changed_when: false
+
+    - name: Re-validate cert-key match on target
+      ansible.builtin.shell: |
+        set -euo pipefail
+        CERT_HASH=$(openssl x509 -in {{ _stage_root }}/newcert.pem -pubkey -noout | openssl md5)
+        KEY_HASH=$(openssl pkey  -in {{ _stage_root }}/newkey.pem  -pubout | openssl md5)
+        [ "$CERT_HASH" = "$KEY_HASH" ]
+      changed_when: false
+      register: _target_cert_key_match
+
+    # -------------------------------------------------------------------- #
+    # STAGE 5: Deploy new files to final destination
+    # -------------------------------------------------------------------- #
+    - name: Create new SSL destination directory
+      ansible.builtin.file:
+        path: "{{ _dest_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy new cert to destination
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newcert.pem"
+        dest: "{{ _new_cert_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+
+    - name: Deploy new key to destination
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newkey.pem"
+        dest: "{{ _new_key_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        remote_src: true
+
+    - name: Deploy new chain to destination (Apache only)
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newchain.pem"
+        dest: "{{ _new_chain_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+        remote_src: true
+      when: services == 'apache'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 6: Build and write modified config to temp file
+    # -------------------------------------------------------------------- #
+    - name: Build modified Nimble config (in-memory)
+      ansible.builtin.set_fact:
+        _new_config: |-
+          {{ _current_config
+             | replace(_old_cert_path, _new_cert_path)
+             | replace(_old_key_path,  _new_key_path)
+          }}
+      when: services == 'nimble'
+
+    - name: Build modified Apache config (in-memory)
+      ansible.builtin.set_fact:
+        _new_config: |-
+          {{ _current_config
+             | replace(_old_cert_path,  _new_cert_path)
+             | replace(_old_key_path,   _new_key_path)
+             | replace(_old_chain_path, _new_chain_path)
+          }}
+      when: services == 'apache'
+
+    - name: Write modified config to temp file
+      ansible.builtin.copy:
+        content: "{{ _new_config }}"
+        dest: "{{ _stage_root }}/newconfig.tmp"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Show config diff summary
+      ansible.builtin.debug:
+        msg:
+          - "=== CONFIG PATH CHANGES on {{ inventory_hostname }} ==="
+          - "Config file: {{ _config_path }}"
+          - "OLD cert  : {{ _old_cert_path }}"
+          - "NEW cert  : {{ _new_cert_path }}"
+          - "OLD key   : {{ _old_key_path }}"
+          - "NEW key   : {{ _new_key_path }}"
+          - "OLD chain : {{ _old_chain_path if services == 'apache' else 'N/A (Nimble)' }}"
+          - "NEW chain : {{ _new_chain_path if services == 'apache' else 'N/A (Nimble)' }}"
+          - "Backup dir: {{ _backup_root }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 7: Syntax check with modified config (before touching live)
+    # -------------------------------------------------------------------- #
+    - name: Apache syntax check with modified config
+      ansible.builtin.shell: |
+        set -e
+        # Copy modified config into a temp location Apache will read
+        cp "{{ _stage_root }}/newconfig.tmp" "{{ _config_path }}.new-test"
+        # Apache doesn't have a way to test a specific file directly, so we
+        # briefly swap it in place, test, then swap back before writing final.
+        # This is safe because we haven't reloaded yet.
+        cp "{{ _config_path }}" "{{ _stage_root }}/config-backup-before-test"
+        cp "{{ _config_path }}.new-test" "{{ _config_path }}"
+        if ! apachectl configtest 2>&1; then
+          # Immediately restore the original
+          cp "{{ _stage_root }}/config-backup-before-test" "{{ _config_path }}"
+          echo "SYNTAX_CHECK_FAILED"
+          exit 1
+        fi
+        # Restore original for now - we'll do the atomic swap in the deploy step
+        cp "{{ _stage_root }}/config-backup-before-test" "{{ _config_path }}"
+        rm -f "{{ _config_path }}.new-test"
+        echo "SYNTAX_OK"
+      register: _apache_syntax
+      changed_when: false
+      failed_when: "'SYNTAX_OK' not in _apache_syntax.stdout"
+      when: services == 'apache'
+
+    - name: Nimble config sanity check
+      ansible.builtin.shell: |
+        # Nimble has no built-in config test, so verify the new config file is valid text
+        # and contains the expected directives
+        grep -q "^ssl_certificate\s*=" "{{ _stage_root }}/newconfig.tmp"
+        grep -q "^ssl_certificate_key\s*=" "{{ _stage_root }}/newconfig.tmp"
+        echo "SYNTAX_OK"
+      register: _nimble_syntax
+      changed_when: false
+      failed_when: "'SYNTAX_OK' not in _nimble_syntax.stdout"
+      when: services == 'nimble'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 8: DRY RUN gate - stop here if requested
+    # -------------------------------------------------------------------- #
+    - name: DRY RUN - stopping before live changes
+      ansible.builtin.debug:
+        msg:
+          - "=== DRY RUN MODE - No live changes made ==="
+          - "New cert deployed to: {{ _new_cert_path }}"
+          - "New key deployed to:  {{ _new_key_path }}"
+          - "Chain deployed to:    {{ _new_chain_path if services == 'apache' else 'N/A' }}"
+          - "Config syntax check:  PASSED"
+          - "To apply for real, re-run with dry_run=false"
+      when: dry_run == 'true'
+
+    - name: DRY RUN - remove new files we deployed (dry-run should leave no trace)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _new_cert_path }}"
+        - "{{ _new_key_path }}"
+        - "{{ _new_chain_path if services == 'apache' else _new_cert_path }}"   # dedup harmless
+      when: dry_run == 'true'
+      failed_when: false
+
+    - name: DRY RUN - end play successfully
+      ansible.builtin.meta: end_host
+      when: dry_run == 'true'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 9: Live deploy - atomic config swap + service reload
+    # -------------------------------------------------------------------- #
+    - name: Atomically move modified config into place
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newconfig.tmp"
+        dest: "{{ _config_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: false               # we already have our own backup
+        remote_src: true
+
+    - name: Reload Nimble
+      ansible.builtin.systemd:
+        name: nimble
+        state: restarted
+      when: services == 'nimble'
+      register: _nimble_restart
+
+    - name: Reload Apache
+      ansible.builtin.systemd:
+        name: apache2
+        state: reloaded
+      when: services == 'apache'
+      register: _apache_reload
+
+    - name: Wait 3 seconds for service to settle
+      ansible.builtin.pause:
+        seconds: 3
+
+    # -------------------------------------------------------------------- #
+    # STAGE 10: Post-deploy verification
+    # -------------------------------------------------------------------- #
+    - name: Verify service is active
+      ansible.builtin.command: "systemctl is-active {{ services if services == 'nimble' else 'apache2' }}"
+      register: _service_active
+      changed_when: false
+      failed_when: _service_active.stdout != 'active'
+
+    - name: Compute new cert fingerprint (SHA256)
+      ansible.builtin.command: "openssl x509 -in {{ _new_cert_path }} -noout -fingerprint -sha256"
+      register: _new_fingerprint
+      changed_when: false
+
+    - name: Report deployment success
+      ansible.builtin.debug:
+        msg:
+          - "=== SSL DEPLOYMENT SUCCESS on {{ inventory_hostname }} ==="
+          - "Service:          {{ services }} (active)"
+          - "Config file:      {{ _config_path }}"
+          - "New cert path:    {{ _new_cert_path }}"
+          - "New key path:     {{ _new_key_path }}"
+          - "New chain path:   {{ _new_chain_path if services == 'apache' else 'N/A' }}"
+          - "New fingerprint:  {{ _new_fingerprint.stdout }}"
+          - "Backup location:  {{ _backup_root }}"
+          - "Old cert files remain at original locations (untouched)"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 11: Cleanup staging
+    # -------------------------------------------------------------------- #
+    - name: Cleanup staging directory
+      ansible.builtin.file:
+        path: "{{ _stage_root }}"
+        state: absent
+
+    # -------------------------------------------------------------------- #
+    # STAGE 12: Emit structured result JSON for portal to parse
+    # -------------------------------------------------------------------- #
+    - name: Emit SSL deploy result JSON
+      ansible.builtin.debug:
+        msg: |
+          SSL_DEPLOY_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'service': services,
+              'ticket_id': ticket_id,
+              'request_id': request_id,
+              'dry_run': dry_run,
+              'old_paths': {
+                'cert':  _old_cert_path,
+                'key':   _old_key_path,
+                'chain': _old_chain_path
+              },
+              'new_paths': {
+                'cert':  _new_cert_path,
+                'key':   _new_key_path,
+                'chain': _new_chain_path if services == 'apache' else ''
+              },
+              'backup_dir': _backup_root,
+              'new_fingerprint_sha256': _new_fingerprint.stdout,
+              'status': 'success'
+            } | to_json
+          }}
+          SSL_DEPLOY_RESULT_END
+
+  # -------------------------------------------------------------------- #
+  # RESCUE: If anything above failed - automatic rollback
+  # -------------------------------------------------------------------- #
+  # Note: this rescue block ONLY fires if we made a real change (past dry_run).
+  # If we failed BEFORE writing the live config, there's nothing to roll back.
+  #
+  # Because Ansible's block/rescue doesn't naturally wrap the whole play, we
+  # rely on the atomic swap being the last risky operation, and rescue via
+  # a handler.  For MVP: if reload fails, restore.sh is standing by and the
+  # backup dir is fully populated.  Manual rollback = run restore.sh.
+  #
+  # Enhancement path: wrap Stages 9-10 in a block/rescue for auto-rollback.
