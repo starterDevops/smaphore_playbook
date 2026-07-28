@@ -457,11 +457,13 @@
       changed_when: false
 
     - name: Re-validate cert-key match on target
-      ansible.builtin.shell: |
-        set -euo pipefail
-        CERT_HASH=$(openssl x509 -in {{ _stage_root }}/newcert.pem -pubkey -noout | openssl md5)
-        KEY_HASH=$(openssl pkey  -in {{ _stage_root }}/newkey.pem  -pubout | openssl md5)
-        [ "$CERT_HASH" = "$KEY_HASH" ]
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          CERT_HASH=$(openssl x509 -in {{ _stage_root }}/newcert.pem -pubkey -noout | openssl md5)
+          KEY_HASH=$(openssl pkey  -in {{ _stage_root }}/newkey.pem  -pubout | openssl md5)
+          [ "$CERT_HASH" = "$KEY_HASH" ]
+        executable: /bin/bash
       changed_when: false
       register: _target_cert_key_match
 
