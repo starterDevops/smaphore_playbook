@@ -550,41 +550,77 @@
     # -------------------------------------------------------------------- #
     # STAGE 7: Syntax check with modified config (before touching live)
     # -------------------------------------------------------------------- #
-    - name: Apache syntax check with modified config
-      ansible.builtin.shell: |
-        set -e
-        # Copy modified config into a temp location Apache will read
-        cp "{{ _stage_root }}/newconfig.tmp" "{{ _config_path }}.new-test"
-        # Apache doesn't have a way to test a specific file directly, so we
-        # briefly swap it in place, test, then swap back before writing final.
-        # This is safe because we haven't reloaded yet.
-        cp "{{ _config_path }}" "{{ _stage_root }}/config-backup-before-test"
-        cp "{{ _config_path }}.new-test" "{{ _config_path }}"
-        if ! apachectl configtest 2>&1; then
-          # Immediately restore the original
-          cp "{{ _stage_root }}/config-backup-before-test" "{{ _config_path }}"
-          echo "SYNTAX_CHECK_FAILED"
-          exit 1
-        fi
-        # Restore original for now - we'll do the atomic swap in the deploy step
-        cp "{{ _stage_root }}/config-backup-before-test" "{{ _config_path }}"
-        rm -f "{{ _config_path }}.new-test"
-        echo "SYNTAX_OK"
-      register: _apache_syntax
-      changed_when: false
-      failed_when: "'SYNTAX_OK' not in _apache_syntax.stdout"
+    # Apache syntax check works by briefly swapping in the new config, running
+    # apachectl configtest, then restoring the original. This is safe because
+    # we don't reload the service until the deploy stage.
+    - name: Apache syntax check - stage new config in place
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newconfig.tmp"
+        dest: "{{ _stage_root }}/config-backup-before-test"
+        remote_src: true
       when: services == 'apache'
 
-    - name: Nimble config sanity check
-      ansible.builtin.shell: |
-        # Nimble has no built-in config test, so verify the new config file is valid text
-        # and contains the expected directives
-        grep -q "^ssl_certificate\s*=" "{{ _stage_root }}/newconfig.tmp"
-        grep -q "^ssl_certificate_key\s*=" "{{ _stage_root }}/newconfig.tmp"
-        echo "SYNTAX_OK"
-      register: _nimble_syntax
+    - name: Apache syntax check - save current config
+      ansible.builtin.copy:
+        src: "{{ _config_path }}"
+        dest: "{{ _stage_root }}/config-backup-before-test-orig"
+        remote_src: true
+      when: services == 'apache'
+
+    - name: Apache syntax check - swap in new config temporarily
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newconfig.tmp"
+        dest: "{{ _config_path }}"
+        remote_src: true
+        backup: false
+      when: services == 'apache'
+
+    - name: Apache syntax check - run apachectl configtest
+      ansible.builtin.command: apachectl configtest
+      register: _apache_syntax
       changed_when: false
-      failed_when: "'SYNTAX_OK' not in _nimble_syntax.stdout"
+      failed_when: false
+      when: services == 'apache'
+
+    - name: Apache syntax check - restore original config regardless of test outcome
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/config-backup-before-test-orig"
+        dest: "{{ _config_path }}"
+        remote_src: true
+        backup: false
+      when: services == 'apache'
+
+    - name: Apache syntax check - fail play if configtest failed
+      ansible.builtin.assert:
+        that:
+          - _apache_syntax.rc == 0
+        fail_msg: "Apache configtest failed with new SSL paths. Output: {{ _apache_syntax.stderr | default(_apache_syntax.stdout) }}"
+      when: services == 'apache'
+
+    # Nimble has no built-in config validator, so we verify the new config
+    # file contains the expected SSL directives before proceeding.
+    - name: Nimble config sanity check - verify ssl_certificate directive present
+      ansible.builtin.lineinfile:
+        path: "{{ _stage_root }}/newconfig.tmp"
+        regexp: '^\s*ssl_certificate\s*='
+        line: 'placeholder'
+        state: present
+      check_mode: true
+      register: _nimble_cert_check
+      changed_when: false
+      failed_when: _nimble_cert_check.msg is defined and 'line added' in _nimble_cert_check.msg
+      when: services == 'nimble'
+
+    - name: Nimble config sanity check - verify ssl_certificate_key directive present
+      ansible.builtin.lineinfile:
+        path: "{{ _stage_root }}/newconfig.tmp"
+        regexp: '^\s*ssl_certificate_key\s*='
+        line: 'placeholder'
+        state: present
+      check_mode: true
+      register: _nimble_key_check
+      changed_when: false
+      failed_when: _nimble_key_check.msg is defined and 'line added' in _nimble_key_check.msg
       when: services == 'nimble'
 
     # -------------------------------------------------------------------- #
