@@ -50,6 +50,10 @@ all:
       ansible_host: 10.70.1.2
     vodfsd2:
       ansible_host: 10.70.1.5
+    Pshvod1:
+      ansible_host: 172.16.27.228
+    pshvod2:
+       ansible_host: 172.20.20.179
   children:
     nayatv_live:
       hosts:
@@ -70,8 +74,6 @@ all:
       hosts:
         streambe1.nayatel.com:
         streambe2.nayatel.com:
-        streamfe1.nayatel.com:
-        streamfe2.nayatel.com:
     test:
       hosts:
         livestream5:
@@ -91,3 +93,7 @@ all:
       hosts:
         vodfsd1:
         vodfsd2:
+        Pshvod1:
+        Pshvod2:
+        streambe1.nayatel.com:
+        streambe2.nayatel.com:
