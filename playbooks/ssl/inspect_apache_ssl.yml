@@ -1,0 +1,257 @@
+---
+# =============================================================================
+#  inspect_apache_ssl.yml
+#  Deep Apache SSL configuration discovery.
+#
+#  Scans EVERY common location for Apache SSL configuration:
+#    Debian/Ubuntu:
+#      /etc/apache2/sites-enabled/*.conf
+#      /etc/apache2/sites-available/*.conf
+#      /etc/apache2/conf-enabled/*.conf
+#      /etc/apache2/mods-enabled/ssl.conf
+#      /etc/apache2/apache2.conf
+#    RedHat/CentOS:
+#      /etc/httpd/conf.d/*.conf
+#      /etc/httpd/conf/httpd.conf
+#      /etc/httpd/conf.d/ssl.conf
+#
+#  For each config file that contains SSL directives, extracts:
+#    - All <VirtualHost *:443> blocks
+#    - ServerName + ServerAlias per VHost
+#    - SSLCertificateFile / SSLCertificateKeyFile / SSLCertificateChainFile
+#    - Current cert subject, SANs, expiry, fingerprint
+#
+#  This playbook makes NO changes. Safe to run on production.
+#
+#  Extra vars (Semaphore survey):
+#    target_group : Ansible group name (e.g. "vod", "test")
+#    request_id   : Log tag
+# =============================================================================
+
+- name: "Apache SSL deep inspection"
+  hosts: "{{ target_group }}"
+  become: true
+  gather_facts: true
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  vars:
+    # All locations to scan for Apache SSL configs
+    _apache_scan_paths:
+      - /etc/apache2/sites-enabled
+      - /etc/apache2/sites-available
+      - /etc/apache2/conf-enabled
+      - /etc/apache2/mods-enabled
+      - /etc/httpd/conf.d
+      - /etc/httpd/conf
+
+  pre_tasks:
+    - name: Normalize inputs
+      ansible.builtin.set_fact:
+        target_group: "{{ target_group | default('') | trim }}"
+        request_id:   "{{ request_id   | default('apache-inspect-' + ansible_date_time.iso8601_basic_short) | trim }}"
+
+    - name: Initialize findings container
+      ansible.builtin.set_fact:
+        apache_findings:
+          host: "{{ inventory_hostname }}"
+          request_id: "{{ request_id }}"
+          apache_installed: false
+          apache_flavor: "unknown"
+          scanned_paths: []
+          ssl_configs: []
+          summary:
+            total_ssl_configs: 0
+            total_ssl_vhosts: 0
+            certs_seen: []
+
+  tasks:
+
+    # -------------------------------------------------------------------- #
+    # STAGE 1: Detect Apache flavor
+    # -------------------------------------------------------------------- #
+    - name: Check for Debian/Ubuntu Apache
+      ansible.builtin.stat:
+        path: /etc/apache2/apache2.conf
+      register: _debian_apache
+
+    - name: Check for RedHat/CentOS Apache
+      ansible.builtin.stat:
+        path: /etc/httpd/conf/httpd.conf
+      register: _redhat_apache
+
+    - name: Set Apache flavor
+      ansible.builtin.set_fact:
+        apache_findings: "{{ apache_findings | combine({
+          'apache_installed': _debian_apache.stat.exists or _redhat_apache.stat.exists,
+          'apache_flavor': (_debian_apache.stat.exists) | ternary('debian-ubuntu', (_redhat_apache.stat.exists) | ternary('redhat-centos', 'unknown'))
+        }) }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 2: Scan each candidate path for config files
+    # -------------------------------------------------------------------- #
+    - name: Check each scan path exists
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ _apache_scan_paths }}"
+      register: _path_stats
+
+    - name: Build list of paths that exist
+      ansible.builtin.set_fact:
+        _existing_paths: "{{ _path_stats.results | selectattr('stat.exists') | map(attribute='item') | list }}"
+
+    - name: Record scanned paths in findings
+      ansible.builtin.set_fact:
+        apache_findings: "{{ apache_findings | combine({'scanned_paths': _existing_paths}) }}"
+
+    - name: Find all .conf files in existing scan paths
+      ansible.builtin.find:
+        paths: "{{ _existing_paths }}"
+        patterns: "*.conf"
+        file_type: any
+        recurse: false
+      register: _all_conf_files
+      when: _existing_paths | length > 0
+
+    - name: Also check apache2.conf and httpd.conf (main configs)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/apache2/apache2.conf
+        - /etc/httpd/conf/httpd.conf
+      register: _main_configs
+
+    - name: Build complete list of config files to inspect
+      ansible.builtin.set_fact:
+        _all_config_paths: "{{
+          (_all_conf_files.files | default([]) | map(attribute='path') | list) +
+          (_main_configs.results | selectattr('stat.exists') | map(attribute='stat.path') | list)
+        }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 3: Read each config file's contents
+    # -------------------------------------------------------------------- #
+    - name: Read each config file
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: "{{ _all_config_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _config_contents
+      failed_when: false
+
+    # -------------------------------------------------------------------- #
+    # STAGE 4: Parse each config for SSL directives
+    # -------------------------------------------------------------------- #
+    - name: Extract SSL info from each config
+      ansible.builtin.set_fact:
+        _parsed_configs: "{{ (_parsed_configs | default([])) + [_parsed] }}"
+      loop: "{{ _config_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      vars:
+        _content: "{{ (item.content | default('') | b64decode) }}"
+        _has_ssl: "{{ 'SSLCertificateFile' in _content }}"
+        _cert_lines:  "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateFile\\s')      | list }}"
+        _key_lines:   "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateKeyFile\\s')   | list }}"
+        _chain_lines: "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateChainFile\\s') | list }}"
+        _server_names: "{{ _content.split('\n') | select('search', '^\\s*ServerName\\s')  | list }}"
+        _server_aliases: "{{ _content.split('\n') | select('search', '^\\s*ServerAlias\\s') | list }}"
+        _vhost_starts: "{{ _content.split('\n') | select('search', '<VirtualHost[^>]*:443') | list }}"
+        _parsed:
+          config_path: "{{ item.item }}"
+          readable: "{{ item.content is defined }}"
+          has_ssl: "{{ _has_ssl }}"
+          vhost_count_443: "{{ _vhost_starts | length }}"
+          cert_paths_found: "{{ _cert_lines | map('regex_replace', '^\\s*SSLCertificateFile\\s+', '') | map('trim') | list }}"
+          key_paths_found: "{{ _key_lines | map('regex_replace', '^\\s*SSLCertificateKeyFile\\s+', '') | map('trim') | list }}"
+          chain_paths_found: "{{ _chain_lines | map('regex_replace', '^\\s*SSLCertificateChainFile\\s+', '') | map('trim') | list }}"
+          server_names: "{{ _server_names | map('regex_replace', '^\\s*ServerName\\s+', '') | map('trim') | list }}"
+          server_aliases: "{{ _server_aliases | map('regex_replace', '^\\s*ServerAlias\\s+', '') | map('trim') | list }}"
+
+    - name: Filter to only configs that have SSL directives
+      ansible.builtin.set_fact:
+        _ssl_configs: "{{ _parsed_configs | default([]) | selectattr('has_ssl') | list }}"
+
+    - name: Report configs found
+      ansible.builtin.debug:
+        msg: "Found {{ _ssl_configs | length }} config file(s) with SSL directives on {{ inventory_hostname }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 5: For each unique cert file found, inspect it with openssl
+    # -------------------------------------------------------------------- #
+    - name: Build unique cert paths list
+      ansible.builtin.set_fact:
+        _unique_cert_paths: "{{ (_ssl_configs | map(attribute='cert_paths_found') | list | flatten | unique | list) }}"
+
+    - name: Inspect each unique cert with openssl
+      ansible.builtin.command: >
+        openssl x509 -in {{ item }} -noout -subject -issuer -dates -fingerprint -sha256 -ext subjectAltName
+      loop: "{{ _unique_cert_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _cert_details
+      changed_when: false
+      failed_when: false
+
+    - name: Build cert details lookup
+      ansible.builtin.set_fact:
+        _cert_info_by_path: "{{ _cert_info_by_path | default({}) | combine({item.item: {
+          'output': item.stdout | default(''),
+          'error':  item.stderr | default(''),
+          'rc':     item.rc | default(1)
+        }}) }}"
+      loop: "{{ _cert_details.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 6: Assemble final findings with cert details attached
+    # -------------------------------------------------------------------- #
+    - name: Enrich each SSL config with cert details
+      ansible.builtin.set_fact:
+        _enriched_configs: "{{ (_enriched_configs | default([])) + [{
+          'config_path': item.config_path,
+          'vhost_count_443': item.vhost_count_443,
+          'cert_paths_found': item.cert_paths_found,
+          'key_paths_found': item.key_paths_found,
+          'chain_paths_found': item.chain_paths_found,
+          'server_names': item.server_names,
+          'server_aliases': item.server_aliases,
+          'cert_details': (item.cert_paths_found | map('extract', _cert_info_by_path | default({})) | list)
+        }] }}"
+      loop: "{{ _ssl_configs }}"
+      loop_control:
+        label: "{{ item.config_path }}"
+
+    - name: Populate final findings structure
+      ansible.builtin.set_fact:
+        apache_findings: "{{ apache_findings | combine({
+          'ssl_configs': _enriched_configs | default([]),
+          'summary': {
+            'total_ssl_configs': _ssl_configs | length,
+            'total_ssl_vhosts':  _ssl_configs | map(attribute='vhost_count_443') | map('int') | sum,
+            'unique_cert_paths': _unique_cert_paths
+          }
+        }) }}"
+
+  post_tasks:
+    - name: Emit structured JSON findings
+      ansible.builtin.debug:
+        msg: |
+          APACHE_INSPECT_RESULT_BEGIN
+          {{ apache_findings | to_json }}
+          APACHE_INSPECT_RESULT_END
+
+    - name: Emit human-readable summary
+      ansible.builtin.debug:
+        msg:
+          - "===== Apache SSL Inspection Summary for {{ inventory_hostname }} ====="
+          - "Apache flavor:       {{ apache_findings.apache_flavor }}"
+          - "Apache installed:    {{ apache_findings.apache_installed }}"
+          - "Scan paths existed:  {{ apache_findings.scanned_paths | length }}"
+          - "Configs with SSL:    {{ apache_findings.summary.total_ssl_configs }}"
+          - "Total :443 VHosts:   {{ apache_findings.summary.total_ssl_vhosts }}"
+          - "Unique cert files:   {{ apache_findings.summary.unique_cert_paths | length }}"
+          - "===================================================="
