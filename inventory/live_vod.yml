@@ -52,8 +52,16 @@ all:
       ansible_host: 10.70.1.5
     Pshvod1:
       ansible_host: 172.16.27.228
-    pshvod2:
+    Pshvod2:
        ansible_host: 172.20.20.179
+    streamgrw1:
+      ansible_host:  101.50.81.45
+    streamgrw2:
+      ansible_host: 101.50.81.37
+    streamsgd1:
+      ansible_host: 172.16.67.38
+    streamsgd2:
+      ansible_host: 115.186.186.98
   children:
     nayatv_live:
       hosts:
@@ -97,3 +105,7 @@ all:
         Pshvod2:
         streambe1.nayatel.com:
         streambe2.nayatel.com:
+        streamgrw1:
+        streamgrw2:
+        streamsgd2:
+        
