@@ -46,6 +46,10 @@ all:
       ansible_host: 202.165.249.204
     umairtest: 
       ansible_host: 101.50.83.111
+    vodfsd1:
+      ansible_host: 10.70.1.2
+    vodfsd2:
+      ansible_host: 10.70.1.5
   children:
     nayatv_live:
       hosts:
@@ -83,3 +87,7 @@ all:
     test3:
       hosts:
         umairtest:
+    FSDVOD:
+      hosts:
+        vodfsd1:
+        vodfsd2:
