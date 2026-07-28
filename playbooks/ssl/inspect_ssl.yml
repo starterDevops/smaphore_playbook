@@ -19,7 +19,8 @@
   hosts: "{{ target_group }}"
   become: true
   gather_facts: true
-
+  vars_files:
+    - ../group_vars/all/vault.yml
   pre_tasks:
     - name: Normalize inputs (trim + lowercase where appropriate)
       ansible.builtin.set_fact:
