@@ -150,8 +150,8 @@
 
     - name: Build absolute source paths
       ansible.builtin.set_fact:
-        _cert_abs: "{{ _upload_dir }}/{{ services == 'nimble' | ternary(nimble_cert_src, apache_cert_src) }}"
-        _key_abs:  "{{ _upload_dir }}/{{ services == 'nimble' | ternary(nimble_key_src,  apache_key_src)  }}"
+        _cert_abs: "{{ _upload_dir }}/{{ (services == 'nimble') | ternary(nimble_cert_src, apache_cert_src) }}"
+        _key_abs:  "{{ _upload_dir }}/{{ (services == 'nimble') | ternary(nimble_key_src,  apache_key_src)  }}"
         _chain_abs: "{{ _upload_dir }}/{{ apache_chain_src }}"
 
     - name: Verify cert source file exists on control node
