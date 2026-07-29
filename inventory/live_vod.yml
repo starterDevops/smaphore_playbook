@@ -95,7 +95,6 @@ all:
         livestream5:
     test2:
       hosts:
-        nayatvbenew:
         nayatvbe2new:
         fsddplc1:
         grwdplc1:
