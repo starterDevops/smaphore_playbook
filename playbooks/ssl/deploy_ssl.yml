@@ -276,17 +276,63 @@
     # -------------------------------------------------------------------- #
     # STAGE 1: Ensure paths and directories exist on target
     # -------------------------------------------------------------------- #
-    - name: Verify target config file exists
+    - name: Verify target config file exists (as specified)
+      ansible.builtin.stat:
+        path: "{{ _config_path }}"
+      register: _target_config
+      failed_when: false
+
+    - name: Auto-discover Nimble config if specified path is invalid
+      ansible.builtin.find:
+        paths:
+          - /etc/nimble
+          - /opt/nimble
+          - /etc
+        patterns: "nimble.conf"
+        recurse: true
+        file_type: file
+      register: _nimble_discovered
+      when:
+        - services == 'nimble'
+        - not (_target_config.stat.exists | default(false)) or not (_target_config.stat.isreg | default(false))
+      failed_when: false
+
+    - name: Report auto-discovered Nimble config paths
+      ansible.builtin.debug:
+        msg:
+          - "Specified config path was invalid or not a regular file: {{ _config_path }}"
+          - "Auto-discovered candidate paths:"
+          - "{{ _nimble_discovered.files | default([]) | map(attribute='path') | list }}"
+      when:
+        - services == 'nimble'
+        - _nimble_discovered is defined
+        - _nimble_discovered.files is defined
+
+    - name: Use auto-discovered Nimble config if exactly one candidate found
+      ansible.builtin.set_fact:
+        _config_path: "{{ _nimble_discovered.files[0].path }}"
+      when:
+        - services == 'nimble'
+        - _nimble_discovered is defined
+        - _nimble_discovered.files is defined
+        - _nimble_discovered.files | length == 1
+
+    - name: Re-verify target config after possible auto-discovery
       ansible.builtin.stat:
         path: "{{ _config_path }}"
       register: _target_config
 
-    - name: Fail if target config file missing
+    - name: Fail with clear guidance if config file still missing
       ansible.builtin.assert:
         that:
-          - _target_config.stat.exists
-          - _target_config.stat.isreg
-        fail_msg: "Target config file {{ _config_path }} does not exist on {{ inventory_hostname }}"
+          - _target_config.stat.exists | default(false)
+          - _target_config.stat.isreg | default(false)
+        fail_msg: |
+          Could not find a valid config file at {{ _config_path }} on {{ inventory_hostname }}.
+          For Nimble: standard location is /etc/nimble/nimble.conf. Auto-discovery searched
+          /etc/nimble, /opt/nimble, and /etc for nimble.conf.
+          Please provide the correct path via the 'nimble_config' variable in the Semaphore survey.
+          Discovered candidates: {{ _nimble_discovered.files | default([]) | map(attribute='path') | list if services == 'nimble' else 'N/A' }}
 
     - name: Read current target config
       ansible.builtin.slurp:
