@@ -32,7 +32,7 @@ all:
       ansible_host: 203.175.74.69
     nayatvfe2-new:
       ansible_host: 115.186.184.178
-    nayatvbenew:
+    nayatvbe1new:
       ansible_host: 58.65.169.84
     nayatvbe2new:
       ansible_host: 58.65.169.85
@@ -102,7 +102,7 @@ all:
         livestreamlhr:
     test3:
       hosts:
-        umairtest:
+        nayatvbe1new:
     FSDVOD:
       hosts:
         vodfsd1:
