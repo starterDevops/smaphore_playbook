@@ -71,7 +71,7 @@ all:
     streamsgd2:
       ansible_host: 115.186.186.98
   children:
-    nayatv_live:
+    nayatv_live_servers:
       hosts:
         livestream5:
         livestream6:
@@ -84,34 +84,38 @@ all:
         nayatvfe07:
         nayatvfe1-new:
         nayatvfe2-new:
-        nayatvbenew:
-        nayatvbe2new:
-    vod:
-      hosts:
-        streambe1.nayatel.com:
-        streambe2.nayatel.com:
-    test:
-      hosts:
-        livestream5:
-    test2:
-      hosts:
+        nayatvbe1new:
         nayatvbe2new:
         fsddplc1:
         grwdplc1:
         mtndplc1:
         livestreamlhr:
-    test3:
+        
+    ISB_Vod:
       hosts:
-        nayatvbe1new:
-    FSDVOD:
+        streambe1.nayatel.com:
+        streambe2.nayatel.com:
+    FSD_VOD:
       hosts:
         vodfsd1:
         vodfsd2:
+    PSH_VOD:
+      hosts:
         Pshvod1:
         Pshvod2:
-        streambe1.nayatel.com:
-        streambe2.nayatel.com:
+    GRW_VOD:
+      hosts:
         streamgrw1:
         streamgrw2:
+    SGD_VOD:
+      hosts:
         streamsgd2:
+    All_VOD_Servers:
+      hosts:
+        ISB_Vod:
+        FSD_VOD:
+        PSH_VOD:
+        GRW_VOD:
+        SGD_VOD:
+        
         
