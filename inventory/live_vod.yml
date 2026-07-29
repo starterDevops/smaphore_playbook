@@ -36,6 +36,14 @@ all:
       ansible_host: 58.65.169.84
     nayatvbe2new:
       ansible_host: 58.65.169.85
+    fsddplc1:
+      ansible_host: 103.55.68.202
+    grwdplc1:
+      ansible_host: 101.50.89.122
+    mtndplc1:
+      ansible_host: 101.50.91.138
+    livestreamlhr:
+      ansible_host: 101.50.114.34
     streambe1.nayatel.com:
       ansible_host: 172.16.179.189
     streambe2.nayatel.com:
@@ -87,13 +95,12 @@ all:
         livestream5:
     test2:
       hosts:
-        nayatvfe1-new:
-        nayatvfe2-new:
-        nayatvfe01:
-        nayatvfe02:
-        nayatvfe03:
-        nayatvfe04:
-        nayatvfe05:
+        nayatvbenew:
+        nayatvbe2new:
+        fsddplc1:
+        grwdplc1:
+        mtndplc1:
+        livestreamlhr:
     test3:
       hosts:
         umairtest:
