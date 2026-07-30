@@ -1,0 +1,651 @@
+---
+# =============================================================================
+#  enable_apache_ssl.yml
+#  Set up SSL on Apache hosts that DON'T have SSL configured yet.
+#
+#  For renewal of existing SSL, use renew_apache_ssl.yml.
+#
+#  APPROACH:
+#     - Discovers whether target host has existing SSL (fails if yes - use renewal)
+#     - Deploys cert/key/chain to standard paths with year-based naming
+#     - Enables mod_ssl if not already enabled
+#     - Generates new VHost config for port 443
+#     - Preserves existing port 80 setup (no redirect added)
+#     - Runs configtest, reloads, verifies via openssl s_client
+#     - Auto-rollback on failure
+#
+#  REQUIRED SEMAPHORE SURVEY VARIABLES (only 7):
+#    target_group   : Ansible group of hosts to enable SSL on
+#    ticket_id      : Change ticket reference
+#    request_id     : Unique per-run identifier
+#    dry_run        : "true" or "false"
+#    server_name    : ServerName for SSL VHost (or "auto" for hostname + .nayatel.com)
+#    document_root  : Where Apache serves files from (default "/var/www/html")
+#    ssl_port       : Port for HTTPS (default "443", can be "8443" or any custom port)
+#
+#  OPTIONAL (usually leave as default):
+#    cert_src       : Cert filename in upload dir (default "cert.pem")
+#    key_src        : Key filename in upload dir  (default "key.pem")
+#    chain_src      : Chain filename (default empty)
+#
+#  HARDCODED DEFAULTS INSIDE PLAYBOOK (not survey variables):
+#    - Cert destination:   /etc/ssl/certs/wild_nayatel_com_26_27.pem
+#    - Key destination:    /etc/ssl/private/wild_nayatel_com_26_27.key
+#    - Chain destination:  /etc/ssl/certs/wild_nayatel_com_26_27.ca (if provided)
+#    - New config file:    /etc/apache2/sites-available/ssl.conf
+#    - HTTP redirect:      NO (both port 80 and SSL port serve independently)
+#    - TLS protocols:      TLSv1.2, TLSv1.3
+#
+#  If you need to change any of these, edit the vars block below.
+#
+#  Uploads must exist at /opt/ufw-portal/ssl-uploads/req_<request_id>/
+# =============================================================================
+
+# --------------------------------------------------------------------------- #
+#  PLAY 1: Control-node preflight
+# --------------------------------------------------------------------------- #
+- name: "Apache SSL enable - Control-node preflight"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  vars:
+    _upload_dir: "/opt/ufw-portal/ssl-uploads/req_{{ request_id | trim }}"
+
+  pre_tasks:
+    - name: Normalize inputs
+      ansible.builtin.set_fact:
+        target_group:  "{{ target_group | default('') | trim }}"
+        ticket_id:     "{{ ticket_id | default('') | trim }}"
+        request_id:    "{{ request_id | default('') | trim }}"
+        dry_run:       "{{ dry_run | default('true') | trim | lower }}"
+        server_name:   "{{ server_name | default('auto') | trim }}"
+        document_root: "{{ document_root | default('/var/www/html') | trim }}"
+        ssl_port:      "{{ ssl_port | default('443') | trim }}"
+        cert_src:      "{{ cert_src | default('cert.pem') | trim }}"
+        key_src:       "{{ key_src | default('key.pem')  | trim }}"
+        chain_src:     "{{ chain_src | default('') | trim }}"
+
+    - name: Validate required inputs
+      ansible.builtin.assert:
+        that:
+          - target_group | length > 0
+          - request_id | length > 0
+          - dry_run in ['true', 'false']
+          - document_root | length > 0
+          - ssl_port | int > 0
+          - ssl_port | int < 65536
+        fail_msg: "target_group, request_id, document_root, ssl_port are required. dry_run must be 'true' or 'false'. ssl_port must be a valid port number."
+
+    - name: Build absolute source paths
+      ansible.builtin.set_fact:
+        _cert_abs:  "{{ _upload_dir }}/{{ cert_src }}"
+        _key_abs:   "{{ _upload_dir }}/{{ key_src }}"
+        _chain_abs: "{{ _upload_dir }}/{{ chain_src }}"
+        _chain_provided: "{{ chain_src | length > 0 }}"
+
+    - name: Verify upload directory exists
+      ansible.builtin.stat:
+        path: "{{ _upload_dir }}"
+      register: _upload_dir_stat
+      failed_when: not _upload_dir_stat.stat.exists
+
+    - name: Verify cert source file exists
+      ansible.builtin.stat:
+        path: "{{ _cert_abs }}"
+      register: _cert_stat
+      failed_when: not _cert_stat.stat.exists
+
+    - name: Verify key source file exists
+      ansible.builtin.stat:
+        path: "{{ _key_abs }}"
+      register: _key_stat
+      failed_when: not _key_stat.stat.exists
+
+    - name: Validate cert is PEM format
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout"
+      register: _cert_pem_check
+      changed_when: false
+
+    - name: Validate key is PEM format
+      ansible.builtin.command: "openssl pkey -in {{ _key_abs }} -noout"
+      register: _key_pem_check
+      changed_when: false
+
+    - name: Extract cert public key hash
+      ansible.builtin.shell:
+        cmd: "openssl x509 -in {{ _cert_abs }} -pubkey -noout | openssl md5"
+        executable: /bin/bash
+      register: _cert_pub_hash
+      changed_when: false
+
+    - name: Extract key public key hash
+      ansible.builtin.shell:
+        cmd: "openssl pkey -in {{ _key_abs }} -pubout | openssl md5"
+        executable: /bin/bash
+      register: _key_pub_hash
+      changed_when: false
+
+    - name: Verify cert-key match
+      ansible.builtin.assert:
+        that:
+          - _cert_pub_hash.stdout == _key_pub_hash.stdout
+        fail_msg: "Certificate does not match private key."
+
+    - name: Compute new cert fingerprint
+      ansible.builtin.shell:
+        cmd: "openssl x509 -in {{ _cert_abs }} -noout -fingerprint -sha256 | cut -d= -f2"
+        executable: /bin/bash
+      register: _new_cert_fp
+      changed_when: false
+
+    - name: Compute new cert expiry
+      ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -enddate"
+      register: _new_cert_expiry
+      changed_when: false
+
+    - name: Extract new cert SANs
+      ansible.builtin.shell:
+        cmd: |
+          openssl x509 -in {{ _cert_abs }} -noout -ext subjectAltName \
+            | grep -oE 'DNS:[^,]*' | sed 's/DNS://g' | tr -d ' '
+        executable: /bin/bash
+      register: _new_cert_sans_raw
+      changed_when: false
+
+    - name: Build SANs list
+      ansible.builtin.set_fact:
+        _new_cert_sans: "{{ _new_cert_sans_raw.stdout_lines | map('trim') | select | list }}"
+
+    - name: Report preflight
+      ansible.builtin.debug:
+        msg:
+          - "===== ENABLE MODE PREFLIGHT PASSED ====="
+          - "Target group:   {{ target_group }}"
+          - "Ticket:         {{ ticket_id }}"
+          - "Request ID:     {{ request_id }}"
+          - "Dry run:        {{ dry_run }}"
+          - "Server name:    {{ server_name }} {{ '(auto = inventory_hostname + .nayatel.com)' if server_name == 'auto' else '(explicit)' }}"
+          - "Document root:  {{ document_root }}"
+          - "SSL port:       {{ ssl_port }}"
+          - "Cert file:      {{ _cert_abs }}"
+          - "Cert expiry:    {{ _new_cert_expiry.stdout }}"
+          - "Fingerprint:    {{ _new_cert_fp.stdout | trim }}"
+          - "SANs:           {{ _new_cert_sans }}"
+          - "======================================="
+
+    - name: Publish preflight facts
+      ansible.builtin.set_fact:
+        _pf:
+          cert_abs:       "{{ _cert_abs }}"
+          key_abs:        "{{ _key_abs }}"
+          chain_abs:      "{{ _chain_abs }}"
+          chain_provided: "{{ _chain_provided }}"
+          new_fp:         "{{ _new_cert_fp.stdout | trim }}"
+          new_sans:       "{{ _new_cert_sans }}"
+          new_expiry:     "{{ _new_cert_expiry.stdout }}"
+        cacheable: true
+
+# --------------------------------------------------------------------------- #
+#  PLAY 2: Per-host enable (serial)
+# --------------------------------------------------------------------------- #
+- name: "Apache SSL enable - Deploy to target hosts"
+  hosts: "{{ target_group }}"
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: false
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  # ============ HARDCODED DEFAULTS (edit here if standards change) ============
+  vars:
+    # Destination paths for SSL files (year-based naming)
+    _cert_dest:  "/etc/ssl/certs/wild_nayatel_com_26_27.pem"
+    _key_dest:   "/etc/ssl/private/wild_nayatel_com_26_27.key"
+    _chain_dest: "/etc/ssl/certs/wild_nayatel_com_26_27.ca"
+
+    # New config file location
+    _config_dest:   "/etc/apache2/sites-available/ssl.conf"
+    _enable_symlink: "/etc/apache2/sites-enabled/ssl.conf"
+
+    # DocumentRoot and SSL port - from survey (with fallback defaults)
+    _document_root: "{{ hostvars['localhost']['document_root'] }}"
+    _ssl_port: "{{ hostvars['localhost']['ssl_port'] }}"
+
+    # Backup and staging paths
+    _backup_root: "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch }}"
+    _stage_root:  "/tmp/ssl-enable-staging-{{ request_id }}-{{ ansible_date_time.epoch }}"
+
+    # Preflight facts from Play 1
+    _new_cert_abs:  "{{ hostvars['localhost']['_pf']['cert_abs'] }}"
+    _new_key_abs:   "{{ hostvars['localhost']['_pf']['key_abs'] }}"
+    _new_chain_abs: "{{ hostvars['localhost']['_pf']['chain_abs'] }}"
+    _chain_provided: "{{ hostvars['localhost']['_pf']['chain_provided'] }}"
+    _new_fp:        "{{ hostvars['localhost']['_pf']['new_fp'] }}"
+    _new_sans:      "{{ hostvars['localhost']['_pf']['new_sans'] }}"
+
+    # Compute effective server name
+    _effective_server_name: >-
+      {%- if hostvars['localhost']['server_name'] != 'auto' -%}
+      {{ hostvars['localhost']['server_name'] }}
+      {%- else -%}
+      {{ inventory_hostname | regex_replace('\\.nayatel\\.com$', '') }}.nayatel.com
+      {%- endif -%}
+
+  tasks:
+    # -------------------------------------------------------------------- #
+    # STAGE 1: Precondition checks
+    # -------------------------------------------------------------------- #
+    - name: Check for sites-enabled directory
+      ansible.builtin.stat:
+        path: /etc/apache2/sites-enabled
+      register: _sites_enabled
+
+    - name: Fail if not Debian/Ubuntu Apache
+      ansible.builtin.fail:
+        msg: "Host {{ inventory_hostname }} does not have /etc/apache2/sites-enabled. Only Debian/Ubuntu Apache is supported."
+      when: not _sites_enabled.stat.exists
+
+    - name: List enabled config files
+      ansible.builtin.find:
+        paths: /etc/apache2/sites-enabled
+        patterns: "*.conf"
+        file_type: any
+      register: _enabled_files
+
+    - name: Read each enabled config
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ _enabled_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: _enabled_contents
+
+    - name: Check if any existing config has SSL
+      ansible.builtin.set_fact:
+        _has_existing_ssl: "{{ (_enabled_contents.results | map(attribute='content') | map('b64decode') | join('\n')) is search('SSLCertificateFile') }}"
+
+    - name: Report existing SSL detection
+      ansible.builtin.debug:
+        msg:
+          - "===== Precondition Check on {{ inventory_hostname }} ====="
+          - "Has existing SSL: {{ _has_existing_ssl }}"
+          - "Effective ServerName will be: {{ _effective_server_name }}"
+
+    - name: Fail if host already has SSL (must use renewal instead)
+      ansible.builtin.fail:
+        msg: |
+          Host {{ inventory_hostname }} ALREADY has SSL configured.
+          This playbook is ONLY for first-time SSL setup.
+          Use renew_apache_ssl.yml instead to update the existing cert.
+      when: _has_existing_ssl
+
+    - name: Check if our target config file already exists
+      ansible.builtin.stat:
+        path: "{{ _config_dest }}"
+      register: _config_dest_stat
+
+    - name: Fail if target config file exists (avoid overwrite)
+      ansible.builtin.fail:
+        msg: |
+          Config file {{ _config_dest }} already exists on {{ inventory_hostname }}.
+          Cannot proceed - would overwrite existing file.
+          Remove it manually or choose a different filename.
+      when: _config_dest_stat.stat.exists
+
+    - name: Verify new cert covers the ServerName
+      ansible.builtin.set_fact:
+        _domain_covered: "{{ (_effective_server_name in _new_sans) or (_new_sans | select('match', '^\\*\\.') | list | length > 0 and _effective_server_name is match('.*\\.nayatel\\.com$')) }}"
+
+    - name: Fail if cert does not cover ServerName
+      ansible.builtin.fail:
+        msg: |
+          New cert SANs {{ _new_sans }} do NOT cover ServerName '{{ _effective_server_name }}'.
+          Cannot deploy this cert on this host.
+      when: not _domain_covered
+
+    # -------------------------------------------------------------------- #
+    # STAGE 2: Backup marker (nothing to back up, but create dir + marker)
+    # -------------------------------------------------------------------- #
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ _backup_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create backup marker
+      ansible.builtin.copy:
+        dest: "{{ _backup_root }}/ENABLE_MODE_MARKER.txt"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          ENABLE MODE - no prior SSL config existed on {{ inventory_hostname }}.
+          Ticket: {{ ticket_id }} | Request: {{ request_id }}
+          Generated: {{ ansible_date_time.iso8601 }}
+          ServerName being set up: {{ _effective_server_name }}
+
+          To rollback: run bash {{ _backup_root }}/restore.sh
+          This will remove all files created and disable the new site.
+
+    # -------------------------------------------------------------------- #
+    # STAGE 3: Generate restore.sh
+    # -------------------------------------------------------------------- #
+    - name: Generate restore.sh
+      ansible.builtin.copy:
+        dest: "{{ _backup_root }}/restore.sh"
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Enable-mode rollback for {{ inventory_hostname }}
+          # Ticket: {{ ticket_id }} | Request: {{ request_id }}
+          set -e
+          echo "Disabling and removing SSL setup..."
+
+          # Disable the new site
+          a2dissite ssl.conf || true
+
+          # Remove config file
+          rm -f {{ _config_dest }}
+
+          # Remove cert files
+          rm -f {{ _cert_dest }}
+          rm -f {{ _key_dest }}
+          {% if _chain_provided %}
+          rm -f {{ _chain_dest }}
+          {% endif %}
+
+          # Reload Apache
+          apachectl configtest
+          systemctl reload apache2
+          sleep 2
+          systemctl is-active apache2
+          echo "Rollback complete."
+
+    # -------------------------------------------------------------------- #
+    # STAGE 4: Stage cert files
+    # -------------------------------------------------------------------- #
+    - name: Create staging directory
+      ansible.builtin.file:
+        path: "{{ _stage_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Ship new cert to staging
+      ansible.builtin.copy:
+        src: "{{ _new_cert_abs }}"
+        dest: "{{ _stage_root }}/newcert.pem"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Ship new key to staging
+      ansible.builtin.copy:
+        src: "{{ _new_key_abs }}"
+        dest: "{{ _stage_root }}/newkey.pem"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ship new chain to staging (if provided)
+      ansible.builtin.copy:
+        src: "{{ _new_chain_abs }}"
+        dest: "{{ _stage_root }}/newchain.pem"
+        owner: root
+        group: root
+        mode: '0644'
+      when: _chain_provided
+
+    - name: Re-validate cert+key match on target
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          C=$(openssl x509 -in {{ _stage_root }}/newcert.pem -pubkey -noout | openssl md5)
+          K=$(openssl pkey  -in {{ _stage_root }}/newkey.pem  -pubout   | openssl md5)
+          [ "$C" = "$K" ]
+        executable: /bin/bash
+      changed_when: false
+
+    # -------------------------------------------------------------------- #
+    # STAGE 5: DRY-RUN gate
+    # -------------------------------------------------------------------- #
+    - name: DRY-RUN summary
+      ansible.builtin.debug:
+        msg:
+          - "===== DRY RUN - No changes made ====="
+          - "Would set up SSL on {{ inventory_hostname }}"
+          - "ServerName:       {{ _effective_server_name }}"
+          - "SSL port:         {{ _ssl_port }}"
+          - "Cert path:        {{ _cert_dest }}"
+          - "Key path:         {{ _key_dest }}"
+          - "Chain path:       {{ _chain_dest if _chain_provided else '(none)' }}"
+          - "Config file:      {{ _config_dest }}"
+          - "DocumentRoot:     {{ _document_root }}"
+          - "Backup dir:       {{ _backup_root }}"
+      when: dry_run == 'true'
+
+    - name: DRY-RUN cleanup staging
+      ansible.builtin.file:
+        path: "{{ _stage_root }}"
+        state: absent
+      when: dry_run == 'true'
+
+    - name: DRY-RUN end
+      ansible.builtin.meta: end_host
+      when: dry_run == 'true'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 6: Deploy cert files
+    # -------------------------------------------------------------------- #
+    - name: Ensure cert destination directory exists
+      ansible.builtin.file:
+        path: "{{ _cert_dest | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Ensure key destination directory exists
+      ansible.builtin.file:
+        path: "{{ _key_dest | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0710'
+
+    - name: Deploy new cert
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newcert.pem"
+        dest: "{{ _cert_dest }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Deploy new key
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newkey.pem"
+        dest: "{{ _key_dest }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Deploy new chain (if provided)
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newchain.pem"
+        dest: "{{ _chain_dest }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0644'
+      when: _chain_provided
+
+    # -------------------------------------------------------------------- #
+    # STAGE 7: Enable mod_ssl and generate VHost
+    # -------------------------------------------------------------------- #
+    - name: Enable mod_ssl
+      ansible.builtin.command: a2enmod ssl
+      register: _mod_ssl_result
+      changed_when: "'already enabled' not in _mod_ssl_result.stdout"
+
+    - name: Check current Apache ports.conf
+      ansible.builtin.slurp:
+        src: /etc/apache2/ports.conf
+      register: _ports_conf
+
+    - name: Check if custom SSL port is already listening
+      ansible.builtin.set_fact:
+        _port_already_listening: "{{ (_ports_conf.content | b64decode) is search('Listen ' + _ssl_port | string) }}"
+
+    - name: Add Listen directive for custom SSL port (if not 443 and not already there)
+      ansible.builtin.lineinfile:
+        path: /etc/apache2/ports.conf
+        line: "Listen {{ _ssl_port }}"
+        insertafter: '^Listen 443'
+        create: false
+      when:
+        - _ssl_port | string != '443'
+        - not _port_already_listening
+
+    - name: Generate SSL VHost config
+      ansible.builtin.copy:
+        dest: "{{ _config_dest }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # SSL VHost auto-generated by enable_apache_ssl.yml
+          # Ticket: {{ ticket_id }} | Request: {{ request_id }}
+          # Host: {{ inventory_hostname }} | Generated: {{ ansible_date_time.iso8601 }}
+          #
+          # Port 80 is left untouched - existing port 80 setup continues
+          # to serve traffic independently.
+
+          <VirtualHost *:{{ _ssl_port }}>
+              ServerName {{ _effective_server_name }}
+
+              DocumentRoot {{ _document_root }}
+
+              SSLEngine on
+              SSLCertificateFile {{ _cert_dest }}
+              SSLCertificateKeyFile {{ _key_dest }}
+              {% if _chain_provided %}
+              SSLCertificateChainFile {{ _chain_dest }}
+              {% endif %}
+
+              SSLProtocol -all +TLSv1.2 +TLSv1.3
+              SSLCipherSuite ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+              SSLHonorCipherOrder off
+
+              ErrorLog ${APACHE_LOG_DIR}/{{ inventory_hostname }}-ssl-error.log
+              CustomLog ${APACHE_LOG_DIR}/{{ inventory_hostname }}-ssl-access.log combined
+          </VirtualHost>
+
+    - name: Enable the new site
+      ansible.builtin.command: a2ensite ssl.conf
+      register: _a2ensite_result
+      changed_when: "'already enabled' not in _a2ensite_result.stdout"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 8: Configtest with rollback on failure
+    # -------------------------------------------------------------------- #
+    - name: Run apachectl configtest
+      ansible.builtin.command: apachectl configtest
+      register: _configtest
+      changed_when: false
+      failed_when: false
+
+    - name: Rollback on configtest failure
+      block:
+        - name: Show configtest error
+          ansible.builtin.debug:
+            msg:
+              - "===== CONFIGTEST FAILED ====="
+              - "{{ _configtest.stderr | default(_configtest.stdout) }}"
+              - "Running rollback..."
+
+        - name: Execute restore.sh
+          ansible.builtin.command: "bash {{ _backup_root }}/restore.sh"
+          register: _rollback_result
+          failed_when: false
+          changed_when: true
+
+        - name: Show rollback result
+          ansible.builtin.debug:
+            var: _rollback_result.stdout_lines
+
+        - name: Fail with clear message
+          ansible.builtin.fail:
+            msg: "Configtest failed and rollback was attempted. See {{ _backup_root }} for details."
+      when: _configtest.rc != 0
+
+    # -------------------------------------------------------------------- #
+    # STAGE 9: Reload Apache and verify
+    # -------------------------------------------------------------------- #
+    - name: Reload Apache
+      ansible.builtin.systemd:
+        name: apache2
+        state: reloaded
+
+    - name: Wait 3 seconds
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: Verify Apache active
+      ansible.builtin.command: systemctl is-active apache2
+      register: _apache_active
+      changed_when: false
+      failed_when: _apache_active.stdout != 'active'
+
+    - name: Verify new cert is being served
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          FP=$(echo "" | openssl s_client -connect localhost:{{ _ssl_port }} -servername {{ _effective_server_name }} 2>/dev/null \
+                  | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+          echo "$FP"
+        executable: /bin/bash
+      register: _served_fp
+      changed_when: false
+      failed_when: false
+
+    - name: Assert served fingerprint matches new
+      ansible.builtin.assert:
+        that:
+          - _served_fp.stdout | trim == _new_fp
+        fail_msg: "Post-enable verification failed on port {{ _ssl_port }}. Expected {{ _new_fp }}, got {{ _served_fp.stdout | trim }}. Manual rollback: bash {{ _backup_root }}/restore.sh"
+
+    # -------------------------------------------------------------------- #
+    # STAGE 10: Cleanup + report
+    # -------------------------------------------------------------------- #
+    - name: Cleanup staging
+      ansible.builtin.file:
+        path: "{{ _stage_root }}"
+        state: absent
+
+    - name: Report success
+      ansible.builtin.debug:
+        msg:
+          - "===== SSL ENABLED on {{ inventory_hostname }} ====="
+          - "ServerName:      {{ _effective_server_name }}"
+          - "SSL port:        {{ _ssl_port }}"
+          - "Cert path:       {{ _cert_dest }}"
+          - "Key path:        {{ _key_dest }}"
+          - "Chain path:      {{ _chain_dest if _chain_provided else '(none)' }}"
+          - "Config file:     {{ _config_dest }}"
+          - "New fingerprint: {{ _new_fp }}"
+          - "Backup dir:      {{ _backup_root }}"
+          - "Rollback cmd:    bash {{ _backup_root }}/restore.sh"
+          - "==================================================="
