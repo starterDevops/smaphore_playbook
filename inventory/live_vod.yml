@@ -89,6 +89,10 @@ all:
       hosts:
         streamfe3: 
         streamfe4:
+        
+    F_T_SSL:          # first time SSL
+      hosts:
+        streamgrw2:
 
     All_VOD_Servers:
       children:
