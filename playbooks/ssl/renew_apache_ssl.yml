@@ -286,6 +286,26 @@
       ansible.builtin.set_fact:
         _ssl_configs: "{{ _ssl_vhosts | selectattr('has_ssl') | list }}"
 
+    - name: Initialize _to_deploy to empty list (safe default)
+      ansible.builtin.set_fact:
+        _to_deploy: []
+
+    - name: Handle case when host has no SSL configs at all
+      block:
+        - name: Report - host has no SSL configs enabled
+          ansible.builtin.debug:
+            msg:
+              - "===== NO SSL CONFIGS on {{ inventory_hostname }} ====="
+              - "This host has Apache running but NO enabled SSL VirtualHost."
+              - "Enabled configs found: {{ _enabled_files.files | map(attribute='path') | list }}"
+              - "This playbook is for RENEWAL of existing SSL. Skipping host."
+              - "For first-time SSL setup, use a different playbook or configure manually."
+              - "======================================================"
+
+        - name: Skip host - nothing to do
+          ansible.builtin.meta: end_host
+      when: _ssl_configs | length == 0
+
     - name: Get current cert fingerprints for each SSL config
       ansible.builtin.shell:
         cmd: "openssl x509 -in {{ item.cert_path }} -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || echo 'ERROR'"
