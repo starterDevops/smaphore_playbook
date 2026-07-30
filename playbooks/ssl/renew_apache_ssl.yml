@@ -83,10 +83,10 @@
         document_root:         "{{ document_root         | default('/var/www/html') | trim }}"
         cert_dest_dir:         "{{ cert_dest_dir         | default('/etc/ssl/certs') | trim }}"
         key_dest_dir:          "{{ key_dest_dir          | default('/etc/ssl/private') | trim }}"
-        cert_dest_filename:    "{{ cert_dest_filename    | default('wild_nayatel_com.pem') | trim }}"
-        key_dest_filename:     "{{ key_dest_filename     | default('wild_nayatel_com.key') | trim }}"
-        chain_dest_filename:   "{{ chain_dest_filename   | default('wild_nayatel_com.ca') | trim }}"
-        add_http_redirect:     "{{ add_http_redirect     | default('true') | trim | lower }}"
+        cert_dest_filename:    "{{ cert_dest_filename    | default('wild_nayatel_com_26_27.pem') | trim }}"
+        key_dest_filename:     "{{ key_dest_filename     | default('wild_nayatel_com_26_27.key') | trim }}"
+        chain_dest_filename:   "{{ chain_dest_filename   | default('wild_nayatel_com_26_27.ca') | trim }}"
+        add_http_redirect:     "{{ add_http_redirect     | default('false') | trim | lower }}"
         new_config_filename:   "{{ new_config_filename   | default('ssl.conf') | trim }}"
 
     - name: Validate required inputs
