@@ -1,29 +1,53 @@
 ---
 # =============================================================================
 #  renew_apache_ssl.yml
-#  Production-grade Apache SSL certificate renewal.
 #
-#  APPROACH: In-place byte replacement of cert/key/chain files.
-#     - Discovers current SSL config in sites-enabled/
-#     - Skips hosts already using this cert (fingerprint match)
-#     - Skips VHosts whose ServerName isn't covered by the new cert
-#     - Backs up EVERY file it will touch to /var/backups/ssl/<request_id>_<epoch>/
-#     - Generates a restore.sh in the backup dir for one-command rollback
-#     - Replaces cert/key/chain at the SAME PATHS the current config points to
-#     - No config file edits (paths don't change)
-#     - Apache configtest -> reload gracefully -> verify with openssl s_client
+#  UNIVERSAL Apache SSL playbook - handles BOTH modes:
 #
-#  SAFETY: Serial deployment (one host at a time). Any failure halts remaining
-#          hosts and provides restore.sh for rollback.
+#  MODE 1: RENEW (default)
+#     - Host already has SSL configured
+#     - Discovers current cert/key/chain paths from sites-enabled/
+#     - Skips hosts where fingerprint already matches (idempotent)
+#     - Replaces cert bytes at existing paths (no config file edit)
+#     - Reloads Apache, verifies via openssl s_client
+#
+#  MODE 2: ENABLE (opt-in via enable_if_missing=true)
+#     - Host has Apache but no SSL VHost configured
+#     - Uses a REFERENCE HOST's config as template (auto-detected from group)
+#     - Falls back to built-in generic template if no reference available
+#     - Ships cert/key/chain, generates VHost config, enables mod_ssl + site
+#     - Optionally adds port 80 → 443 redirect
+#     - Configtest before reload, auto-rollback on failure
+#
+#  DESIGN PRINCIPLES:
+#     - Fail-safe: enable mode requires explicit opt-in
+#     - Idempotent: safe to re-run
+#     - Serial: one host at a time, any_errors_fatal
+#     - Auditable: structured JSON output, backup dir with restore.sh
 #
 #  Extra vars (Semaphore survey):
-#    target_group   : Ansible group name
-#    ticket_id      : Change ticket reference (e.g. "SSL-2026-01")
-#    request_id     : Unique per-run identifier (used in backup path)
-#    dry_run        : "true" or "false" - if true, no live changes
-#    cert_src       : filename on control node (e.g. "cert.pem")
-#    key_src        : filename on control node (e.g. "key.pem")
-#    chain_src      : filename on control node (e.g. "chain.pem" or empty)
+#    target_group          : Ansible group name (required)
+#    ticket_id             : Change ticket reference (required, e.g. "SSL-2026-01")
+#    request_id            : Unique per-run identifier (required)
+#    dry_run               : "true" or "false" (default "true")
+#    cert_src              : Cert filename in upload dir (default "cert.pem")
+#    key_src               : Key filename in upload dir (default "key.pem")
+#    chain_src             : Chain filename in upload dir (default empty = no chain)
+#
+#    -- Enable mode variables (only used when enable_if_missing=true) --
+#    enable_if_missing     : "true" or "false" (default "false")
+#    reference_host        : Explicit reference host inventory name (optional)
+#    server_name_suffix    : Appended to inventory_hostname for ServerName
+#                            (default ".nayatel.com")
+#    server_name_override  : Skip auto-computation, use this explicit name
+#    document_root         : DocumentRoot for enable mode (default "/var/www/html")
+#    cert_dest_dir         : Where cert goes (default "/etc/ssl/certs")
+#    key_dest_dir          : Where key goes (default "/etc/ssl/private")
+#    cert_dest_filename    : Cert filename on target (default "wild_nayatel_com.pem")
+#    key_dest_filename     : Key filename on target (default "wild_nayatel_com.key")
+#    chain_dest_filename   : Chain filename on target (default "wild_nayatel_com.ca")
+#    add_http_redirect     : Also create port 80 → 443 redirect (default "true")
+#    new_config_filename   : Name of new site config (default: "ssl.conf")
 #
 #  Uploads must exist at /opt/ufw-portal/ssl-uploads/req_<request_id>/
 # =============================================================================
@@ -31,7 +55,7 @@
 # --------------------------------------------------------------------------- #
 #  PLAY 1: Control-node preflight
 # --------------------------------------------------------------------------- #
-- name: "Apache SSL renewal - Control-node preflight"
+- name: "Apache SSL - Control-node preflight"
   hosts: localhost
   connection: local
   gather_facts: true
@@ -45,28 +69,42 @@
   pre_tasks:
     - name: Normalize inputs
       ansible.builtin.set_fact:
-        target_group: "{{ target_group | default('') | trim }}"
-        ticket_id:    "{{ ticket_id    | default('') | trim }}"
-        request_id:   "{{ request_id   | default('apache-renew-' + ansible_date_time.iso8601_basic_short) | trim }}"
-        dry_run:      "{{ dry_run      | default('true') | trim | lower }}"
-        cert_src:     "{{ cert_src     | default('cert.pem') | trim }}"
-        key_src:      "{{ key_src      | default('key.pem')  | trim }}"
-        chain_src:    "{{ chain_src    | default('') | trim }}"
+        target_group:          "{{ target_group          | default('') | trim }}"
+        ticket_id:             "{{ ticket_id             | default('') | trim }}"
+        request_id:            "{{ request_id            | default('apache-ssl-' + ansible_date_time.iso8601_basic_short) | trim }}"
+        dry_run:               "{{ dry_run               | default('true') | trim | lower }}"
+        cert_src:              "{{ cert_src              | default('cert.pem') | trim }}"
+        key_src:               "{{ key_src               | default('key.pem') | trim }}"
+        chain_src:             "{{ chain_src             | default('') | trim }}"
+        enable_if_missing:     "{{ enable_if_missing     | default('false') | trim | lower }}"
+        reference_host:        "{{ reference_host        | default('') | trim }}"
+        server_name_suffix:    "{{ server_name_suffix    | default('.nayatel.com') | trim }}"
+        server_name_override:  "{{ server_name_override  | default('') | trim }}"
+        document_root:         "{{ document_root         | default('/var/www/html') | trim }}"
+        cert_dest_dir:         "{{ cert_dest_dir         | default('/etc/ssl/certs') | trim }}"
+        key_dest_dir:          "{{ key_dest_dir          | default('/etc/ssl/private') | trim }}"
+        cert_dest_filename:    "{{ cert_dest_filename    | default('wild_nayatel_com.pem') | trim }}"
+        key_dest_filename:     "{{ key_dest_filename     | default('wild_nayatel_com.key') | trim }}"
+        chain_dest_filename:   "{{ chain_dest_filename   | default('wild_nayatel_com.ca') | trim }}"
+        add_http_redirect:     "{{ add_http_redirect     | default('true') | trim | lower }}"
+        new_config_filename:   "{{ new_config_filename   | default('ssl.conf') | trim }}"
 
     - name: Validate required inputs
       ansible.builtin.assert:
         that:
           - target_group | length > 0
-          - request_id   | length > 0
-          - cert_src     | length > 0
-          - key_src      | length > 0
+          - request_id | length > 0
+          - cert_src | length > 0
+          - key_src | length > 0
           - dry_run in ['true', 'false']
-        fail_msg: "target_group, request_id, cert_src, key_src are required. dry_run must be 'true' or 'false'."
+          - enable_if_missing in ['true', 'false']
+          - add_http_redirect in ['true', 'false']
+        fail_msg: "Missing or invalid required inputs. target_group, request_id, cert_src, key_src are required."
 
     - name: Build absolute source paths
       ansible.builtin.set_fact:
-        _cert_abs:  "{{ _upload_dir }}/{{ cert_src }}"
-        _key_abs:   "{{ _upload_dir }}/{{ key_src }}"
+        _cert_abs: "{{ _upload_dir }}/{{ cert_src }}"
+        _key_abs:  "{{ _upload_dir }}/{{ key_src }}"
         _chain_abs: "{{ _upload_dir }}/{{ chain_src }}"
         _chain_provided: "{{ chain_src | length > 0 }}"
 
@@ -178,21 +216,22 @@
     - name: Report preflight
       ansible.builtin.debug:
         msg:
-          - "===== APACHE SSL RENEWAL PREFLIGHT PASSED ====="
-          - "Target group:    {{ target_group }}"
-          - "Ticket:          {{ ticket_id }}"
-          - "Request ID:      {{ request_id }}"
-          - "Dry run:         {{ dry_run }}"
-          - "New cert file:   {{ _cert_abs }}"
-          - "New key file:    {{ _key_abs }}"
-          - "New chain file:  {{ _chain_abs if _chain_provided else 'NOT PROVIDED' }}"
-          - "New cert expiry: {{ _new_cert_expiry.stdout }}"
-          - "Expires <60d:    {{ 'YES - WARNING' if _cert_expires_soon.rc != 0 else 'no' }}"
-          - "New fingerprint: {{ _new_cert_fp.stdout | trim }}"
-          - "New cert SANs:   {{ _new_cert_sans }}"
-          - "============================================="
+          - "===== APACHE SSL PREFLIGHT PASSED ====="
+          - "Target group:       {{ target_group }}"
+          - "Ticket:             {{ ticket_id }}"
+          - "Request ID:         {{ request_id }}"
+          - "Dry run:            {{ dry_run }}"
+          - "Enable if missing:  {{ enable_if_missing }}"
+          - "New cert file:      {{ _cert_abs }}"
+          - "New key file:       {{ _key_abs }}"
+          - "New chain file:     {{ _chain_abs if _chain_provided else 'NOT PROVIDED' }}"
+          - "New cert expiry:    {{ _new_cert_expiry.stdout }}"
+          - "Expires <60d:       {{ 'YES - WARNING' if _cert_expires_soon.rc != 0 else 'no' }}"
+          - "New fingerprint:    {{ _new_cert_fp.stdout | trim }}"
+          - "New cert SANs:      {{ _new_cert_sans }}"
+          - "======================================="
 
-    - name: Publish preflight facts for target play
+    - name: Publish preflight facts
       ansible.builtin.set_fact:
         _pf:
           cert_abs:       "{{ _cert_abs }}"
@@ -205,12 +244,160 @@
         cacheable: true
 
 # --------------------------------------------------------------------------- #
-#  PLAY 2: Per-host discover -> match -> deploy (serial)
+#  PLAY 2: Discovery pass on ALL target hosts (parallel, read-only)
+#          Classify each host: has_ssl (renew) OR no_ssl (enable)
+#          Extract reference config from first has_ssl host
 # --------------------------------------------------------------------------- #
-- name: "Apache SSL renewal - Deploy to target hosts"
+- name: "Apache SSL - Discovery pass on all target hosts"
   hosts: "{{ target_group }}"
   become: true
   gather_facts: true
+  any_errors_fatal: false
+
+  vars_files:
+    - ../group_vars/all/vault.yml
+
+  tasks:
+    - name: Check for sites-enabled directory
+      ansible.builtin.stat:
+        path: /etc/apache2/sites-enabled
+      register: _sites_enabled
+
+    - name: Set host classification if not Debian/Ubuntu Apache
+      ansible.builtin.set_fact:
+        _host_class: "not_debian_apache"
+      when: not _sites_enabled.stat.exists
+
+    - name: List enabled site config files (Debian/Ubuntu)
+      ansible.builtin.find:
+        paths: /etc/apache2/sites-enabled
+        patterns: "*.conf"
+        file_type: any
+      register: _enabled_files
+      when: _sites_enabled.stat.exists
+
+    - name: Read each enabled config
+      ansible.builtin.slurp:
+        src: "{{ item.path }}"
+      loop: "{{ _enabled_files.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: _enabled_contents
+      when: _sites_enabled.stat.exists
+
+    - name: Detect if any config has SSL directives
+      ansible.builtin.set_fact:
+        _has_ssl_any: "{{ (_enabled_contents.results | default([]) | map(attribute='content') | map('b64decode') | join('\n')) is search('SSLCertificateFile') }}"
+      when: _sites_enabled.stat.exists
+
+    - name: Classify host - has SSL
+      ansible.builtin.set_fact:
+        _host_class: "has_ssl"
+      when:
+        - _sites_enabled.stat.exists
+        - _has_ssl_any | default(false)
+
+    - name: Classify host - no SSL
+      ansible.builtin.set_fact:
+        _host_class: "no_ssl"
+      when:
+        - _sites_enabled.stat.exists
+        - not (_has_ssl_any | default(false))
+
+    - name: Identify the first SSL config's raw content (as potential reference)
+      ansible.builtin.set_fact:
+        _reference_config_raw: >-
+          {%- for c in _enabled_contents.results | default([]) -%}
+          {%- set body = c.content | b64decode -%}
+          {%- if 'SSLCertificateFile' in body -%}
+          {{ body }}
+          {%- break -%}
+          {%- endif -%}
+          {%- endfor -%}
+      when:
+        - _sites_enabled.stat.exists
+        - _has_ssl_any | default(false)
+
+    - name: Report classification
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Class: {{ _host_class }}"
+          - "Has reference config: {{ (_reference_config_raw | default('')) | length > 0 }}"
+
+# --------------------------------------------------------------------------- #
+#  PLAY 3: Aggregate on localhost - build the deployment plan
+# --------------------------------------------------------------------------- #
+- name: "Apache SSL - Aggregate discovery, build plan"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Build list of hosts by class
+      ansible.builtin.set_fact:
+        _hosts_has_ssl:         "{{ groups[hostvars['localhost']['target_group']] | map('extract', hostvars) | selectattr('_host_class', 'defined') | selectattr('_host_class', 'equalto', 'has_ssl') | map(attribute='inventory_hostname') | list }}"
+        _hosts_no_ssl:          "{{ groups[hostvars['localhost']['target_group']] | map('extract', hostvars) | selectattr('_host_class', 'defined') | selectattr('_host_class', 'equalto', 'no_ssl') | map(attribute='inventory_hostname') | list }}"
+        _hosts_not_debian:      "{{ groups[hostvars['localhost']['target_group']] | map('extract', hostvars) | selectattr('_host_class', 'defined') | selectattr('_host_class', 'equalto', 'not_debian_apache') | map(attribute='inventory_hostname') | list }}"
+
+    - name: Select reference config (auto or explicit)
+      ansible.builtin.set_fact:
+        _reference_source_host: >-
+          {%- set explicit = hostvars['localhost']['reference_host'] -%}
+          {%- if explicit and explicit in _hosts_has_ssl -%}
+          {{ explicit }}
+          {%- elif _hosts_has_ssl | length > 0 -%}
+          {{ _hosts_has_ssl[0] }}
+          {%- else -%}
+          {%- endif -%}
+
+    - name: Extract reference config content
+      ansible.builtin.set_fact:
+        _reference_config: "{{ hostvars[_reference_source_host]['_reference_config_raw'] | default('') if _reference_source_host | length > 0 else '' }}"
+
+    - name: Report plan
+      ansible.builtin.debug:
+        msg:
+          - "===== APACHE SSL DEPLOYMENT PLAN ====="
+          - "Target group:       {{ hostvars['localhost']['target_group'] }}"
+          - "Enable-if-missing:  {{ hostvars['localhost']['enable_if_missing'] }}"
+          - "Hosts with SSL (RENEW candidates): {{ _hosts_has_ssl | length }}"
+          - "  {{ _hosts_has_ssl }}"
+          - "Hosts without SSL (ENABLE candidates): {{ _hosts_no_ssl | length }}"
+          - "  {{ _hosts_no_ssl }}"
+          - "Hosts not Debian Apache (SKIP): {{ _hosts_not_debian | length }}"
+          - "  {{ _hosts_not_debian }}"
+          - "Reference source host: {{ _reference_source_host if _reference_source_host | length > 0 else 'NONE (will use generic template)' }}"
+          - "Reference config length: {{ _reference_config | length }} bytes"
+          - "======================================"
+
+    - name: Warn if enable_if_missing but no reference AND some hosts need enable
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: enable_if_missing=true but no reference host has SSL."
+          - "Enable-mode hosts will use the built-in GENERIC template."
+      when:
+        - hostvars['localhost']['enable_if_missing'] == 'true'
+        - _reference_source_host | length == 0
+        - _hosts_no_ssl | length > 0
+
+    - name: Publish plan facts
+      ansible.builtin.set_fact:
+        _plan:
+          hosts_has_ssl:         "{{ _hosts_has_ssl }}"
+          hosts_no_ssl:          "{{ _hosts_no_ssl }}"
+          hosts_not_debian:      "{{ _hosts_not_debian }}"
+          reference_source_host: "{{ _reference_source_host }}"
+          reference_config:      "{{ _reference_config }}"
+        cacheable: true
+
+# --------------------------------------------------------------------------- #
+#  PLAY 4: Per-host serial execution (renew OR enable)
+# --------------------------------------------------------------------------- #
+- name: "Apache SSL - Deploy to target hosts (serial)"
+  hosts: "{{ target_group }}"
+  become: true
+  gather_facts: false
   serial: 1
   any_errors_fatal: true
 
@@ -218,53 +405,69 @@
     - ../group_vars/all/vault.yml
 
   vars:
-    _backup_root: "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch }}"
-    _stage_root:  "/tmp/ssl-renewal-staging-{{ request_id }}-{{ ansible_date_time.epoch }}"
-    _new_cert_abs: "{{ hostvars['localhost']['_pf']['cert_abs'] }}"
-    _new_key_abs:  "{{ hostvars['localhost']['_pf']['key_abs'] }}"
+    _backup_root:   "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch | default('unknown') }}"
+    _stage_root:    "/tmp/ssl-staging-{{ request_id }}-{{ ansible_date_time.epoch | default('unknown') }}"
+    _new_cert_abs:  "{{ hostvars['localhost']['_pf']['cert_abs'] }}"
+    _new_key_abs:   "{{ hostvars['localhost']['_pf']['key_abs'] }}"
     _new_chain_abs: "{{ hostvars['localhost']['_pf']['chain_abs'] }}"
     _chain_provided: "{{ hostvars['localhost']['_pf']['chain_provided'] }}"
-    _new_fp: "{{ hostvars['localhost']['_pf']['new_fp'] }}"
-    _new_sans: "{{ hostvars['localhost']['_pf']['new_sans'] }}"
+    _new_fp:        "{{ hostvars['localhost']['_pf']['new_fp'] }}"
+    _new_sans:      "{{ hostvars['localhost']['_pf']['new_sans'] }}"
+    _reference_config: "{{ hostvars['localhost']['_plan']['reference_config'] }}"
 
   tasks:
 
     # -------------------------------------------------------------------- #
-    # STAGE 1: Discover Apache SSL configs (sites-enabled ONLY)
+    # STAGE 0: Gather facts, decide mode
     # -------------------------------------------------------------------- #
-    - name: Check for sites-enabled directory
-      ansible.builtin.stat:
-        path: /etc/apache2/sites-enabled
-      register: _sites_enabled
+    - name: Gather facts
+      ansible.builtin.setup:
 
-    - name: Fail if not a Debian/Ubuntu Apache host
-      ansible.builtin.assert:
-        that:
-          - _sites_enabled.stat.exists
-        fail_msg: "This host doesn't have /etc/apache2/sites-enabled. Only Debian/Ubuntu Apache is currently supported."
+    - name: Skip host if not Debian/Ubuntu Apache
+      ansible.builtin.meta: end_host
+      when: _host_class == 'not_debian_apache'
 
-    - name: List enabled site config files
+    - name: Skip host - no SSL AND enable mode not opted in
+      block:
+        - name: Report why skipping
+          ansible.builtin.debug:
+            msg:
+              - "===== SKIP {{ inventory_hostname }} ====="
+              - "Host has no SSL configured."
+              - "enable_if_missing is 'false', so first-time SSL setup is NOT performed."
+              - "To enable SSL setup for this host, re-run with enable_if_missing=true."
+              - "========================================="
+
+        - name: End host
+          ansible.builtin.meta: end_host
+      when:
+        - _host_class == 'no_ssl'
+        - hostvars['localhost']['enable_if_missing'] != 'true'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 1: RENEW MODE - discovery of current SSL configs
+    # -------------------------------------------------------------------- #
+    - name: RENEW - list enabled config files
       ansible.builtin.find:
         paths: /etc/apache2/sites-enabled
         patterns: "*.conf"
         file_type: any
-      register: _enabled_files
+      register: _renew_enabled_files
+      when: _host_class == 'has_ssl'
 
-    - name: Read each enabled config
+    - name: RENEW - read each enabled config
       ansible.builtin.slurp:
         src: "{{ item.path }}"
-      loop: "{{ _enabled_files.files }}"
+      loop: "{{ _renew_enabled_files.files | default([]) }}"
       loop_control:
         label: "{{ item.path }}"
-      register: _enabled_contents
+      register: _renew_contents
+      when: _host_class == 'has_ssl'
 
-    # -------------------------------------------------------------------- #
-    # STAGE 2: Parse and identify SSL VHosts + skip decisions
-    # -------------------------------------------------------------------- #
-    - name: Parse each config for SSL directives
+    - name: RENEW - parse each config for SSL directives
       ansible.builtin.set_fact:
         _ssl_vhosts: "{{ _ssl_vhosts | default([]) + [_parsed] }}"
-      loop: "{{ _enabled_contents.results }}"
+      loop: "{{ _renew_contents.results | default([]) }}"
       loop_control:
         label: "{{ item.item.path }}"
       vars:
@@ -272,64 +475,53 @@
         _cert_paths: "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateFile\\s') | map('regex_replace', '^\\s*SSLCertificateFile\\s+', '') | map('trim') | list }}"
         _key_paths:  "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateKeyFile\\s') | map('regex_replace', '^\\s*SSLCertificateKeyFile\\s+', '') | map('trim') | list }}"
         _chain_paths: "{{ _content.split('\n') | select('search', '^\\s*SSLCertificateChainFile\\s') | map('regex_replace', '^\\s*SSLCertificateChainFile\\s+', '') | map('trim') | list }}"
-        _servers:    "{{ _content.split('\n') | select('search', '^\\s*ServerName\\s') | map('regex_replace', '^\\s*ServerName\\s+', '') | map('trim') | list }}"
-        _has_ssl: "{{ _cert_paths | length > 0 }}"
+        _servers: "{{ _content.split('\n') | select('search', '^\\s*ServerName\\s') | map('regex_replace', '^\\s*ServerName\\s+', '') | map('trim') | list }}"
+        _has_ssl_here: "{{ _cert_paths | length > 0 }}"
         _parsed:
           config_path: "{{ item.item.path }}"
-          has_ssl: "{{ _has_ssl }}"
+          has_ssl: "{{ _has_ssl_here }}"
           cert_path:  "{{ _cert_paths[0] | default('') }}"
           key_path:   "{{ _key_paths[0]  | default('') }}"
           chain_path: "{{ _chain_paths[0] | default('') }}"
           server_names: "{{ _servers | unique | list }}"
+      when: _host_class == 'has_ssl'
 
-    - name: Filter to only configs with SSL
+    - name: RENEW - filter to only configs with SSL
       ansible.builtin.set_fact:
-        _ssl_configs: "{{ _ssl_vhosts | selectattr('has_ssl') | list }}"
+        _ssl_configs: "{{ _ssl_vhosts | default([]) | selectattr('has_ssl') | list }}"
+      when: _host_class == 'has_ssl'
 
-    - name: Initialize _to_deploy to empty list (safe default)
+    - name: RENEW - initialize _to_deploy to safe default
       ansible.builtin.set_fact:
         _to_deploy: []
+      when: _host_class == 'has_ssl'
 
-    - name: Handle case when host has no SSL configs at all
-      block:
-        - name: Report - host has no SSL configs enabled
-          ansible.builtin.debug:
-            msg:
-              - "===== NO SSL CONFIGS on {{ inventory_hostname }} ====="
-              - "This host has Apache running but NO enabled SSL VirtualHost."
-              - "Enabled configs found: {{ _enabled_files.files | map(attribute='path') | list }}"
-              - "This playbook is for RENEWAL of existing SSL. Skipping host."
-              - "For first-time SSL setup, use a different playbook or configure manually."
-              - "======================================================"
-
-        - name: Skip host - nothing to do
-          ansible.builtin.meta: end_host
-      when: _ssl_configs | length == 0
-
-    - name: Get current cert fingerprints for each SSL config
+    - name: RENEW - get current cert fingerprints
       ansible.builtin.shell:
         cmd: "openssl x509 -in {{ item.cert_path }} -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || echo 'ERROR'"
         executable: /bin/bash
-      loop: "{{ _ssl_configs }}"
+      loop: "{{ _ssl_configs | default([]) }}"
       loop_control:
         label: "{{ item.config_path }}"
       register: _current_fps
       changed_when: false
+      when: _host_class == 'has_ssl'
 
-    - name: Get current cert subjects for each SSL config
+    - name: RENEW - get current cert subjects
       ansible.builtin.shell:
         cmd: "openssl x509 -in {{ item.cert_path }} -noout -subject 2>/dev/null | sed 's/subject=//' || echo 'ERROR'"
         executable: /bin/bash
-      loop: "{{ _ssl_configs }}"
+      loop: "{{ _ssl_configs | default([]) }}"
       loop_control:
         label: "{{ item.config_path }}"
       register: _current_subjects
       changed_when: false
+      when: _host_class == 'has_ssl'
 
-    - name: Enrich SSL configs with fingerprints and decision
+    - name: RENEW - enrich SSL configs with decision
       ansible.builtin.set_fact:
         _to_deploy: "{{ _to_deploy | default([]) + [_enriched] }}"
-      loop: "{{ range(0, _ssl_configs | length) | list }}"
+      loop: "{{ range(0, _ssl_configs | default([]) | length) | list }}"
       loop_control:
         label: "{{ _ssl_configs[item].config_path }}"
       vars:
@@ -348,6 +540,7 @@
           {%- else -%}
           {%- endif -%}
         _enriched:
+          mode: "renew"
           config_path: "{{ _cfg.config_path }}"
           cert_path: "{{ _cfg.cert_path }}"
           key_path: "{{ _cfg.key_path }}"
@@ -361,30 +554,76 @@
           chain_needed: "{{ _chain_needed }}"
           skip_reason: "{{ _skip_reason | trim }}"
           will_deploy: "{{ _skip_reason | trim | length == 0 }}"
+      when: _host_class == 'has_ssl'
 
     # -------------------------------------------------------------------- #
-    # STAGE 3: Report the decision matrix
+    # STAGE 2: ENABLE MODE - compute enable plan for this host
     # -------------------------------------------------------------------- #
-    - name: Report per-VHost decision
+    - name: ENABLE - compute effective ServerName
+      ansible.builtin.set_fact:
+        _enable_server_name: "{{ (hostvars['localhost']['server_name_override'] | length > 0) | ternary(hostvars['localhost']['server_name_override'], (inventory_hostname | regex_replace('\\.nayatel\\.com$', '')) + hostvars['localhost']['server_name_suffix']) }}"
+      when:
+        - _host_class == 'no_ssl'
+        - hostvars['localhost']['enable_if_missing'] == 'true'
+
+    - name: ENABLE - verify new cert covers ServerName
+      ansible.builtin.set_fact:
+        _enable_domain_covered: "{{ (_enable_server_name in _new_sans) or (_new_sans | select('match', '^\\*\\.') | list | length > 0 and _enable_server_name is match('.*\\.nayatel\\.com$')) }}"
+      when:
+        - _host_class == 'no_ssl'
+        - hostvars['localhost']['enable_if_missing'] == 'true'
+
+    - name: ENABLE - fail if domain not covered
+      ansible.builtin.fail:
+        msg: "ENABLE mode: computed ServerName '{{ _enable_server_name }}' is NOT covered by new cert SANs {{ _new_sans }}. Set server_name_override or use a different cert."
+      when:
+        - _host_class == 'no_ssl'
+        - hostvars['localhost']['enable_if_missing'] == 'true'
+        - not _enable_domain_covered
+
+    - name: ENABLE - initialize enable plan
+      ansible.builtin.set_fact:
+        _to_deploy:
+          - mode: "enable"
+            server_name: "{{ _enable_server_name }}"
+            cert_dest_path: "{{ hostvars['localhost']['cert_dest_dir'] }}/{{ hostvars['localhost']['cert_dest_filename'] }}"
+            key_dest_path:  "{{ hostvars['localhost']['key_dest_dir'] }}/{{ hostvars['localhost']['key_dest_filename'] }}"
+            chain_dest_path: "{{ (_chain_provided) | ternary(hostvars['localhost']['cert_dest_dir'] + '/' + hostvars['localhost']['chain_dest_filename'], '') }}"
+            config_dest_path: "/etc/apache2/sites-available/{{ hostvars['localhost']['new_config_filename'] }}"
+            enable_symlink: "/etc/apache2/sites-enabled/{{ hostvars['localhost']['new_config_filename'] }}"
+            document_root: "{{ hostvars['localhost']['document_root'] }}"
+            add_http_redirect: "{{ hostvars['localhost']['add_http_redirect'] }}"
+            reference_config: "{{ _reference_config | length > 0 }}"
+            will_deploy: true
+            skip_reason: ""
+      when:
+        - _host_class == 'no_ssl'
+        - hostvars['localhost']['enable_if_missing'] == 'true'
+
+    # -------------------------------------------------------------------- #
+    # STAGE 3: Report decision matrix
+    # -------------------------------------------------------------------- #
+    - name: Report per-host decision
       ansible.builtin.debug:
         msg:
-          - "===== SSL VHost Decision Matrix on {{ inventory_hostname }} ====="
-          - "Total SSL configs found: {{ _to_deploy | length }}"
-          - "Will deploy: {{ _to_deploy | selectattr('will_deploy') | list | length }}"
-          - "Will skip:   {{ _to_deploy | rejectattr('will_deploy') | list | length }}"
+          - "===== APACHE SSL Decision for {{ inventory_hostname }} ====="
+          - "Host class: {{ _host_class }}"
+          - "Actions: {{ _to_deploy | default([]) | length }}"
+          - "Will deploy: {{ (_to_deploy | default([]) | selectattr('will_deploy') | list | length) }}"
+          - "Will skip:   {{ (_to_deploy | default([]) | rejectattr('will_deploy') | list | length) }}"
           - "---"
-          - "{{ _to_deploy | to_nice_yaml }}"
+          - "{{ _to_deploy | default([]) | to_nice_yaml }}"
 
-    - name: Determine which VHosts to deploy to
+    - name: Compute deploy targets (things we will actually do)
       ansible.builtin.set_fact:
-        _deploy_targets: "{{ _to_deploy | selectattr('will_deploy') | list }}"
+        _deploy_targets: "{{ _to_deploy | default([]) | selectattr('will_deploy') | list }}"
 
     - name: Skip host if nothing to deploy
       ansible.builtin.meta: end_host
       when: _deploy_targets | length == 0
 
     # -------------------------------------------------------------------- #
-    # STAGE 4: Backup (mandatory before any change)
+    # STAGE 4: Backup EVERYTHING that could be affected
     # -------------------------------------------------------------------- #
     - name: Create backup directory
       ansible.builtin.file:
@@ -394,7 +633,7 @@
         group: root
         mode: '0700'
 
-    - name: Backup each config file that will be affected
+    - name: RENEW - backup affected config files
       ansible.builtin.copy:
         src: "{{ item.config_path }}"
         dest: "{{ _backup_root }}/config{{ item.config_path | replace('/', '_') }}"
@@ -402,11 +641,12 @@
         owner: root
         group: root
         mode: '0644'
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.config_path }}"
+      failed_when: false
 
-    - name: Backup each current cert file
+    - name: RENEW - backup current cert files
       ansible.builtin.copy:
         src: "{{ item.cert_path }}"
         dest: "{{ _backup_root }}/cert{{ item.cert_path | replace('/', '_') }}"
@@ -414,12 +654,12 @@
         owner: root
         group: root
         mode: '0644'
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.cert_path }}"
       failed_when: false
 
-    - name: Backup each current key file
+    - name: RENEW - backup current key files
       ansible.builtin.copy:
         src: "{{ item.key_path }}"
         dest: "{{ _backup_root }}/key{{ item.key_path | replace('/', '_') }}"
@@ -427,12 +667,12 @@
         owner: root
         group: root
         mode: '0600'
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.key_path }}"
       failed_when: false
 
-    - name: Backup each current chain file (where present)
+    - name: RENEW - backup current chain files (if any)
       ansible.builtin.copy:
         src: "{{ item.chain_path }}"
         dest: "{{ _backup_root }}/chain{{ item.chain_path | replace('/', '_') }}"
@@ -440,13 +680,32 @@
         owner: root
         group: root
         mode: '0644'
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.chain_path }}"
       when: item.chain_path | length > 0
       failed_when: false
 
-    - name: Generate restore.sh script
+    - name: ENABLE - record backup marker (nothing to back up but note intent)
+      ansible.builtin.copy:
+        dest: "{{ _backup_root }}/ENABLE_MODE_NOTE.txt"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          This backup dir was created during ENABLE mode.
+          No prior SSL config existed on {{ inventory_hostname }}.
+          To rollback: run `bash {{ _backup_root }}/restore.sh` which will:
+            - Disable the new site
+            - Remove the new cert/key/chain files
+            - Remove the new config file
+            - Reload Apache
+      when: _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length > 0
+
+    # -------------------------------------------------------------------- #
+    # STAGE 5: Generate restore.sh for both modes
+    # -------------------------------------------------------------------- #
+    - name: Generate restore.sh script (universal)
       ansible.builtin.copy:
         dest: "{{ _backup_root }}/restore.sh"
         owner: root
@@ -454,12 +713,14 @@
         mode: '0755'
         content: |
           #!/bin/bash
-          # SSL Renewal Rollback Script
-          # Ticket: {{ ticket_id }} | Request: {{ request_id }} | Host: {{ inventory_hostname }}
-          # Generated: {{ ansible_date_time.iso8601 }}
+          # SSL Rollback Script (auto-generated)
+          # Ticket: {{ ticket_id }} | Request: {{ request_id }}
+          # Host: {{ inventory_hostname }} | Backup: {{ _backup_root }}
           set -e
-          echo "Rolling back SSL changes from backup {{ _backup_root }}..."
+          echo "Rolling back SSL changes on {{ inventory_hostname }}..."
           {% for tgt in _deploy_targets %}
+          {% if tgt.mode == 'renew' %}
+          # RENEW rollback: restore backed-up files
           cp "{{ _backup_root }}/cert{{ tgt.cert_path | replace('/', '_') }}" "{{ tgt.cert_path }}"
           chmod 644 "{{ tgt.cert_path }}"
           cp "{{ _backup_root }}/key{{ tgt.key_path | replace('/', '_') }}" "{{ tgt.key_path }}"
@@ -468,8 +729,18 @@
           cp "{{ _backup_root }}/chain{{ tgt.chain_path | replace('/', '_') }}" "{{ tgt.chain_path }}"
           chmod 644 "{{ tgt.chain_path }}"
           {% endif %}
+          {% else %}
+          # ENABLE rollback: disable new site, remove new files
+          a2dissite "{{ new_config_filename }}" || true
+          rm -f "{{ tgt.config_dest_path }}"
+          rm -f "{{ tgt.cert_dest_path }}"
+          rm -f "{{ tgt.key_dest_path }}"
+          {% if tgt.chain_dest_path | length > 0 %}
+          rm -f "{{ tgt.chain_dest_path }}"
+          {% endif %}
+          {% endif %}
           {% endfor %}
-          echo "Files restored. Testing Apache config..."
+          echo "Testing Apache config..."
           apachectl configtest
           echo "Reloading Apache..."
           systemctl reload apache2
@@ -478,7 +749,7 @@
           echo "Rollback complete."
 
     # -------------------------------------------------------------------- #
-    # STAGE 5: Stage new files on target
+    # STAGE 6: Stage new files on target
     # -------------------------------------------------------------------- #
     - name: Create staging directory
       ansible.builtin.file:
@@ -513,7 +784,7 @@
         mode: '0644'
       when: _chain_provided
 
-    - name: Re-validate cert+key match on target (belt and suspenders)
+    - name: Re-validate cert+key match on target
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
@@ -524,32 +795,32 @@
       changed_when: false
 
     # -------------------------------------------------------------------- #
-    # STAGE 6: DRY-RUN gate
+    # STAGE 7: DRY-RUN gate
     # -------------------------------------------------------------------- #
     - name: DRY-RUN summary
       ansible.builtin.debug:
         msg:
           - "===== DRY RUN - No live changes made ====="
-          - "Would deploy to {{ _deploy_targets | length }} VHost(s)"
+          - "Host: {{ inventory_hostname }} (class: {{ _host_class }})"
+          - "Would deploy: {{ _deploy_targets | length }} action(s)"
           - "Backup would be at: {{ _backup_root }}"
-          - "For each VHost, would replace bytes at these paths:"
-          - "{{ _deploy_targets | map('to_yaml') | list }}"
-      when: dry_run == 'true'
+          - "{{ _deploy_targets | to_nice_yaml }}"
+      when: hostvars['localhost']['dry_run'] == 'true'
 
-    - name: DRY-RUN cleanup
+    - name: DRY-RUN cleanup staging
       ansible.builtin.file:
         path: "{{ _stage_root }}"
         state: absent
-      when: dry_run == 'true'
+      when: hostvars['localhost']['dry_run'] == 'true'
 
     - name: DRY-RUN end
       ansible.builtin.meta: end_host
-      when: dry_run == 'true'
+      when: hostvars['localhost']['dry_run'] == 'true'
 
     # -------------------------------------------------------------------- #
-    # STAGE 7: LIVE DEPLOY - replace cert/key/chain bytes at existing paths
+    # STAGE 8A: RENEW MODE - replace cert/key/chain in place
     # -------------------------------------------------------------------- #
-    - name: Replace cert file at existing path
+    - name: RENEW - replace cert file at existing path
       ansible.builtin.copy:
         src: "{{ _stage_root }}/newcert.pem"
         dest: "{{ item.cert_path }}"
@@ -557,12 +828,11 @@
         owner: root
         group: root
         mode: '0644'
-        backup: false
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.cert_path }}"
 
-    - name: Replace key file at existing path
+    - name: RENEW - replace key file at existing path
       ansible.builtin.copy:
         src: "{{ _stage_root }}/newkey.pem"
         dest: "{{ item.key_path }}"
@@ -570,12 +840,11 @@
         owner: root
         group: root
         mode: '0600'
-        backup: false
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.key_path }}"
 
-    - name: Replace chain file at existing path (if config uses one)
+    - name: RENEW - replace chain file at existing path
       ansible.builtin.copy:
         src: "{{ _stage_root }}/newchain.pem"
         dest: "{{ item.chain_path }}"
@@ -583,14 +852,141 @@
         owner: root
         group: root
         mode: '0644'
-        backup: false
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.chain_path }}"
       when: item.chain_path | length > 0 and _chain_provided
 
     # -------------------------------------------------------------------- #
-    # STAGE 8: Apache configtest before reload
+    # STAGE 8B: ENABLE MODE - deploy new cert files + generate VHost
+    # -------------------------------------------------------------------- #
+    - name: ENABLE - ensure /etc/ssl/certs exists
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost']['cert_dest_dir'] }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length > 0
+
+    - name: ENABLE - ensure /etc/ssl/private exists
+      ansible.builtin.file:
+        path: "{{ hostvars['localhost']['key_dest_dir'] }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0710'
+      when: _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length > 0
+
+    - name: ENABLE - deploy new cert to destination
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newcert.pem"
+        dest: "{{ item.cert_dest_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'enable') | list }}"
+      loop_control:
+        label: "{{ item.cert_dest_path }}"
+
+    - name: ENABLE - deploy new key to destination
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newkey.pem"
+        dest: "{{ item.key_dest_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'enable') | list }}"
+      loop_control:
+        label: "{{ item.key_dest_path }}"
+
+    - name: ENABLE - deploy new chain to destination (if provided)
+      ansible.builtin.copy:
+        src: "{{ _stage_root }}/newchain.pem"
+        dest: "{{ item.chain_dest_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'enable') | list }}"
+      loop_control:
+        label: "{{ item.chain_dest_path }}"
+      when: item.chain_dest_path | length > 0 and _chain_provided
+
+    - name: ENABLE - enable mod_ssl (a2enmod ssl)
+      ansible.builtin.command: a2enmod ssl
+      register: _mod_ssl_result
+      changed_when: "'already enabled' not in _mod_ssl_result.stdout"
+      when: _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length > 0
+
+    - name: ENABLE - generate VHost config from reference
+      ansible.builtin.copy:
+        dest: "{{ item.config_dest_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Auto-generated SSL VHost for {{ inventory_hostname }}
+          # Ticket: {{ ticket_id }} | Request: {{ request_id }}
+          # Generated from: {{ 'reference host (' + hostvars['localhost']['_plan']['reference_source_host'] + ')' if _reference_config | length > 0 else 'generic template' }}
+          {% if _reference_config | length > 0 %}
+          {# Use reference config, but substitute ServerName/ServerAlias/cert paths #}
+          {% set adapted = _reference_config %}
+          {% set adapted = adapted | regex_replace('(?m)^(\s*ServerName)\s+.*$', '\\1 ' + item.server_name) %}
+          {% set adapted = adapted | regex_replace('(?m)^(\s*ServerAlias)\s+.*$', '\\1 www.' + item.server_name) %}
+          {% set adapted = adapted | regex_replace('(?m)^(\s*SSLCertificateFile)\s+.*$', '\\1 ' + item.cert_dest_path) %}
+          {% set adapted = adapted | regex_replace('(?m)^(\s*SSLCertificateKeyFile)\s+.*$', '\\1 ' + item.key_dest_path) %}
+          {% if item.chain_dest_path | length > 0 %}
+          {% set adapted = adapted | regex_replace('(?m)^(\s*SSLCertificateChainFile)\s+.*$', '\\1 ' + item.chain_dest_path) %}
+          {% endif %}
+          {{ adapted }}
+          {% else %}
+          {# GENERIC TEMPLATE #}
+          <VirtualHost *:443>
+              ServerName {{ item.server_name }}
+              ServerAlias www.{{ item.server_name }}
+              DocumentRoot {{ item.document_root }}
+
+              SSLEngine on
+              SSLCertificateFile {{ item.cert_dest_path }}
+              SSLCertificateKeyFile {{ item.key_dest_path }}
+              {% if item.chain_dest_path | length > 0 %}
+              SSLCertificateChainFile {{ item.chain_dest_path }}
+              {% endif %}
+
+              SSLProtocol -all +TLSv1.2 +TLSv1.3
+              SSLCipherSuite ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+              SSLHonorCipherOrder off
+
+              Header always set Strict-Transport-Security "max-age=63072000"
+
+              ErrorLog ${APACHE_LOG_DIR}/{{ inventory_hostname }}-ssl-error.log
+              CustomLog ${APACHE_LOG_DIR}/{{ inventory_hostname }}-ssl-access.log combined
+          </VirtualHost>
+          {% endif %}
+
+          {% if item.add_http_redirect == 'true' %}
+          # HTTP → HTTPS redirect
+          <VirtualHost *:80>
+              ServerName {{ item.server_name }}
+              ServerAlias www.{{ item.server_name }}
+              Redirect permanent / https://{{ item.server_name }}/
+          </VirtualHost>
+          {% endif %}
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'enable') | list }}"
+      loop_control:
+        label: "{{ item.config_dest_path }}"
+
+    - name: ENABLE - enable the new site (a2ensite)
+      ansible.builtin.command: "a2ensite {{ hostvars['localhost']['new_config_filename'] }}"
+      register: _a2ensite_result
+      changed_when: "'already enabled' not in _a2ensite_result.stdout"
+      when: _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length > 0
+
+    # -------------------------------------------------------------------- #
+    # STAGE 9: Configtest + rollback-on-failure
     # -------------------------------------------------------------------- #
     - name: Run apachectl configtest
       ansible.builtin.command: apachectl configtest
@@ -598,56 +994,33 @@
       changed_when: false
       failed_when: false
 
-    - name: If configtest failed, rollback everything and abort
+    - name: Handle configtest failure with rollback
       block:
-        - name: Rollback - restore config files
-          ansible.builtin.copy:
-            src: "{{ _backup_root }}/config{{ item.config_path | replace('/', '_') }}"
-            dest: "{{ item.config_path }}"
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0644'
-          loop: "{{ _deploy_targets }}"
+        - name: Show configtest error
+          ansible.builtin.debug:
+            msg:
+              - "===== APACHE CONFIGTEST FAILED ====="
+              - "stdout: {{ _configtest.stdout }}"
+              - "stderr: {{ _configtest.stderr }}"
+              - "Rolling back changes on {{ inventory_hostname }}..."
 
-        - name: Rollback - restore cert files
-          ansible.builtin.copy:
-            src: "{{ _backup_root }}/cert{{ item.cert_path | replace('/', '_') }}"
-            dest: "{{ item.cert_path }}"
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0644'
-          loop: "{{ _deploy_targets }}"
+        - name: Rollback via restore.sh
+          ansible.builtin.command: "bash {{ _backup_root }}/restore.sh"
+          register: _rollback_result
+          failed_when: false
+          changed_when: true
 
-        - name: Rollback - restore key files
-          ansible.builtin.copy:
-            src: "{{ _backup_root }}/key{{ item.key_path | replace('/', '_') }}"
-            dest: "{{ item.key_path }}"
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0600'
-          loop: "{{ _deploy_targets }}"
+        - name: Show rollback result
+          ansible.builtin.debug:
+            var: _rollback_result
 
-        - name: Rollback - restore chain files
-          ansible.builtin.copy:
-            src: "{{ _backup_root }}/chain{{ item.chain_path | replace('/', '_') }}"
-            dest: "{{ item.chain_path }}"
-            remote_src: true
-            owner: root
-            group: root
-            mode: '0644'
-          loop: "{{ _deploy_targets }}"
-          when: item.chain_path | length > 0
-
-        - name: Fail with rollback message
+        - name: Fail with clear message
           ansible.builtin.fail:
-            msg: "Apache configtest FAILED with new cert. All files restored from backup. See backup at {{ _backup_root }}. Configtest output: {{ _configtest.stderr | default(_configtest.stdout) }}"
+            msg: "Configtest failed. Rollback attempted. See backup at {{ _backup_root }}."
       when: _configtest.rc != 0
 
     # -------------------------------------------------------------------- #
-    # STAGE 9: Graceful reload + verify
+    # STAGE 10: Reload Apache + verify
     # -------------------------------------------------------------------- #
     - name: Reload Apache
       ansible.builtin.systemd:
@@ -658,13 +1031,13 @@
       ansible.builtin.pause:
         seconds: 3
 
-    - name: Verify Apache is still active
+    - name: Verify Apache is active
       ansible.builtin.command: systemctl is-active apache2
       register: _apache_active
       changed_when: false
       failed_when: _apache_active.stdout != 'active'
 
-    - name: Verify new cert is being served (per VHost)
+    - name: Verify new cert is served (RENEW mode)
       ansible.builtin.shell:
         cmd: |
           set -euo pipefail
@@ -672,24 +1045,48 @@
                   | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
           echo "$FP"
         executable: /bin/bash
-      loop: "{{ _deploy_targets }}"
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'renew') | list }}"
       loop_control:
         label: "{{ item.server_names[0] }}"
-      register: _served_fps
+      register: _served_fps_renew
       changed_when: false
       failed_when: false
 
-    - name: Assert served fingerprint matches new fingerprint
+    - name: Verify new cert is served (ENABLE mode)
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          FP=$(echo "" | openssl s_client -connect localhost:443 -servername {{ item.server_name }} 2>/dev/null \
+                  | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+          echo "$FP"
+        executable: /bin/bash
+      loop: "{{ _deploy_targets | selectattr('mode', 'equalto', 'enable') | list }}"
+      loop_control:
+        label: "{{ item.server_name }}"
+      register: _served_fps_enable
+      changed_when: false
+      failed_when: false
+
+    - name: Assert served fingerprint matches new (RENEW)
       ansible.builtin.assert:
         that:
           - item.stdout | trim == _new_fp
-        fail_msg: "Post-deploy verification failed for {{ item.item.server_names[0] }} - served fingerprint {{ item.stdout | trim }} != new fingerprint {{ _new_fp }}. Manual rollback needed: bash {{ _backup_root }}/restore.sh"
-      loop: "{{ _served_fps.results }}"
+        fail_msg: "RENEW post-verify failed for {{ item.item.server_names[0] }}. Manual rollback: bash {{ _backup_root }}/restore.sh"
+      loop: "{{ _served_fps_renew.results | default([]) }}"
       loop_control:
         label: "{{ item.item.server_names[0] }}"
 
+    - name: Assert served fingerprint matches new (ENABLE)
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim == _new_fp
+        fail_msg: "ENABLE post-verify failed for {{ item.item.server_name }}. Manual rollback: bash {{ _backup_root }}/restore.sh"
+      loop: "{{ _served_fps_enable.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.server_name }}"
+
     # -------------------------------------------------------------------- #
-    # STAGE 10: Cleanup + report success
+    # STAGE 11: Cleanup + report success
     # -------------------------------------------------------------------- #
     - name: Cleanup staging
       ansible.builtin.file:
@@ -699,30 +1096,32 @@
     - name: Report success
       ansible.builtin.debug:
         msg:
-          - "===== SSL RENEWAL SUCCESS on {{ inventory_hostname }} ====="
-          - "VHosts updated: {{ _deploy_targets | length }}"
-          - "New fingerprint: {{ _new_fp }}"
-          - "New expiry:      {{ hostvars['localhost']['_pf']['new_expiry'] }}"
-          - "Backup dir:      {{ _backup_root }}"
-          - "Rollback cmd:    bash {{ _backup_root }}/restore.sh"
+          - "===== APACHE SSL SUCCESS on {{ inventory_hostname }} ====="
+          - "Host class:       {{ _host_class }}"
+          - "Actions completed: {{ _deploy_targets | length }}"
+          - "New fingerprint:  {{ _new_fp }}"
+          - "New expiry:       {{ hostvars['localhost']['_pf']['new_expiry'] }}"
+          - "Backup dir:       {{ _backup_root }}"
+          - "Rollback cmd:     bash {{ _backup_root }}/restore.sh"
 
     - name: Emit structured JSON result
       ansible.builtin.debug:
         msg: |
-          SSL_RENEWAL_RESULT_BEGIN
+          SSL_RESULT_BEGIN
           {{
             {
               'host': inventory_hostname,
+              'host_class': _host_class,
               'ticket_id': ticket_id,
               'request_id': request_id,
-              'dry_run': dry_run,
-              'vhosts_updated': _deploy_targets | length,
-              'vhosts_skipped': _to_deploy | rejectattr('will_deploy') | list | length,
-              'skip_reasons': _to_deploy | rejectattr('will_deploy') | map(attribute='skip_reason') | list,
+              'dry_run': hostvars['localhost']['dry_run'],
+              'actions': _deploy_targets | length,
+              'renew_count': _deploy_targets | selectattr('mode', 'equalto', 'renew') | list | length,
+              'enable_count': _deploy_targets | selectattr('mode', 'equalto', 'enable') | list | length,
               'new_fingerprint': _new_fp,
               'new_expiry': hostvars['localhost']['_pf']['new_expiry'],
               'backup_dir': _backup_root,
               'status': 'success'
             } | to_json
           }}
-          SSL_RENEWAL_RESULT_END
+          SSL_RESULT_END
