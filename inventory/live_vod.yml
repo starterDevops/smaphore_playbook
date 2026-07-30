@@ -36,7 +36,7 @@ all:
     streamgrw2:        { ansible_host: 101.50.81.37 }
     streamsgd1:        { ansible_host: 172.16.67.38 }
     streamsgd2:        { ansible_host: 115.186.186.98 }
-    streamfe3:         { ansible_host: 115.186.165.22 }
+    streamfe3:         { ansible_host: 115.186.165.22, ansible_port: 22 }
     streamfe4:         { ansible_host: 202.165.249.199 }
 
   children:
