@@ -4,72 +4,39 @@ all:
     ansible_user: basit.shaukat
     ansible_python_interpreter: /usr/bin/python3
   hosts:
-    livestream5:
-      ansible_host: 203.82.48.74
-    livestream6:
-      ansible_host: 203.99.50.70
-    nayatvfe01:
-      ansible_host: 115.186.184.197
-    nayatvfe02:
-      ansible_host: 115.186.184.198
-    nayatvfe03:
-      ansible_host: 115.186.184.199
-    nayatvfe04:
-      ansible_host: 202.165.249.244
-    nayatvfe05:
-      ansible_host: 202.165.249.246
-    nayatvfe06:
-      ansible_host: 202.165.249.248
-    nayatvfe07:
-      ansible_host: 115.186.184.200
-    livestreamfsd:
-      ansible_host: 45.115.85.134
-    livestreamfsdbkp:
-      ansible_host: 103.55.69.214
-    livestreamlhr:
-      ansible_host: 101.50.114.34
-    nayatvfe1-new:
-      ansible_host: 203.175.74.69
-    nayatvfe2-new:
-      ansible_host: 115.186.184.178
-    nayatvbe1new:
-      ansible_host: 58.65.169.84
-    nayatvbe2new:
-      ansible_host: 58.65.169.85
-    fsddplc1:
-      ansible_host: 103.55.68.202
-    grwdplc1:
-      ansible_host: 101.50.89.122
-    mtndplc1:
-      ansible_host: 101.50.91.138
-    livestreamlhr:
-      ansible_host: 101.50.114.34
-    streambe1.nayatel.com:
-      ansible_host: 172.16.179.189
-    streambe2.nayatel.com:
-      ansible_host: 172.16.250.34
-    streamfe1.nayatel.com:
-      ansible_host: 202.165.249.211
-    streamfe2.nayatel.com:
-      ansible_host: 202.165.249.204
-    umairtest: 
-      ansible_host: 101.50.83.111
-    vodfsd1:
-      ansible_host: 10.70.1.2
-    vodfsd2:
-      ansible_host: 10.70.1.5
-    Pshvod1:
-      ansible_host: 172.16.27.228
-    Pshvod2:
-       ansible_host: 172.20.20.179
-    streamgrw1:
-      ansible_host:  101.50.81.45
-    streamgrw2:
-      ansible_host: 101.50.81.37
-    streamsgd1:
-      ansible_host: 172.16.67.38
-    streamsgd2:
-      ansible_host: 115.186.186.98
+    livestream5:       { ansible_host: 203.82.48.74 }
+    livestream6:       { ansible_host: 203.99.50.70 }
+    nayatvfe01:        { ansible_host: 115.186.184.197 }
+    nayatvfe02:        { ansible_host: 115.186.184.198 }
+    nayatvfe03:        { ansible_host: 115.186.184.199 }
+    nayatvfe04:        { ansible_host: 202.165.249.244 }
+    nayatvfe05:        { ansible_host: 202.165.249.246 }
+    nayatvfe06:        { ansible_host: 202.165.249.248 }
+    nayatvfe07:        { ansible_host: 115.186.184.200 }
+    livestreamfsd:     { ansible_host: 45.115.85.134 }
+    livestreamfsdbkp:  { ansible_host: 103.55.69.214 }
+    livestreamlhr:     { ansible_host: 101.50.114.34 }
+    nayatvfe1-new:     { ansible_host: 203.175.74.69 }
+    nayatvfe2-new:     { ansible_host: 115.186.184.178 }
+    nayatvbe1new:      { ansible_host: 58.65.169.84 }
+    nayatvbe2new:      { ansible_host: 58.65.169.85 }
+    fsddplc1:          { ansible_host: 103.55.68.202 }
+    grwdplc1:          { ansible_host: 101.50.89.122 }
+    mtndplc1:          { ansible_host: 101.50.91.138 }
+    streambe1.nayatel.com: { ansible_host: 172.16.179.189 }
+    streambe2.nayatel.com: { ansible_host: 172.16.250.34 }
+    streamfe1.nayatel.com: { ansible_host: 202.165.249.211 }
+    streamfe2.nayatel.com: { ansible_host: 202.165.249.204 }
+    umairtest:         { ansible_host: 101.50.83.111 }
+    vodfsd1:           { ansible_host: 10.70.1.2 }
+    vodfsd2:           { ansible_host: 10.70.1.5 }
+    Pshvod1:           { ansible_host: 172.16.27.228 }
+    Pshvod2:           { ansible_host: 172.20.20.179 }
+    streamgrw1:        { ansible_host: 101.50.81.45 }
+    streamgrw2:        { ansible_host: 101.50.81.37 }
+    streamsgd1:        { ansible_host: 172.16.67.38 }
+    streamsgd2:        { ansible_host: 115.186.186.98 }
+
   children:
     nayatv_live_servers:
       hosts:
@@ -90,32 +57,36 @@ all:
         grwdplc1:
         mtndplc1:
         livestreamlhr:
-        
+
     ISB_Vod:
       hosts:
         streambe1.nayatel.com:
         streambe2.nayatel.com:
+
     FSD_VOD:
       hosts:
         vodfsd1:
         vodfsd2:
+
     PSH_VOD:
       hosts:
         Pshvod1:
         Pshvod2:
+
     GRW_VOD:
       hosts:
         streamgrw1:
         streamgrw2:
+
     SGD_VOD:
       hosts:
+        streamsgd1:      # add if it belongs here
         streamsgd2:
+
     All_VOD_Servers:
-      hosts:
+      children:
         ISB_Vod:
         FSD_VOD:
         PSH_VOD:
         GRW_VOD:
         SGD_VOD:
-        
-        
