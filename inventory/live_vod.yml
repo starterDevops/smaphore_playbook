@@ -4,6 +4,7 @@ all:
     ansible_user: basit.shaukat
     ansible_python_interpreter: /usr/bin/python3
   hosts:
+    Customer_streaming:         { ansible_host: 58.65.167.202 }
     livestream5:       { ansible_host: 203.82.48.74 }
     livestream6:       { ansible_host: 203.99.50.70 }
     nayatvfe01:        { ansible_host: 115.186.184.197 }
@@ -38,6 +39,7 @@ all:
     streamsgd2:        { ansible_host: 115.186.186.98 }
     streamfe3:         { ansible_host: 115.186.165.22, ansible_port: 22 }
     streamfe4:         { ansible_host: 202.165.249.199 }
+    
 
   children:
     nayatv_live_servers:
