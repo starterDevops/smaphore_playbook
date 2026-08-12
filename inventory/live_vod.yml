@@ -96,6 +96,10 @@ all:
       hosts:
         streamgrw2:
 
+    test:
+      hosts:
+        livestream5:
+
     All_VOD_Servers:
       children:
         ISB_Vod:
