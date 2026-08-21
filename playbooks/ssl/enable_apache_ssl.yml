@@ -217,9 +217,25 @@
     _document_root: "{{ hostvars['localhost']['document_root'] }}"
     _ssl_port: "{{ hostvars['localhost']['ssl_port'] }}"
 
+    # ---------------------------------------------------------------------- #
+    #  Normalised identifiers (fixes PLAYBOOK_FINDINGS P-03)
+    #
+    #  `set_fact` is HOST-SCOPED. Play 1 trims these on localhost; this play
+    #  runs on the targets, which never saw that fact, so a bare
+    #  {{ request_id }} resolves back to the RAW survey value.
+    #
+    #  Note this playbook was already inconsistent with itself: it correctly
+    #  reads document_root, ssl_port and server_name via hostvars['localhost']
+    #  a few lines above, but used the raw values here. A trailing space
+    #  produces a backup directory with a space in its name, which silently
+    #  breaks restore.sh and any rollback the portal later attempts.
+    # ---------------------------------------------------------------------- #
+    _req_id: "{{ (hostvars['localhost']['request_id'] | default(request_id, true)) | trim }}"
+    _tkt_id: "{{ (hostvars['localhost']['ticket_id']  | default(ticket_id,  true)) | trim }}"
+
     # Backup and staging paths
-    _backup_root: "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch }}"
-    _stage_root:  "/tmp/ssl-enable-staging-{{ request_id }}-{{ ansible_date_time.epoch }}"
+    _backup_root: "/var/backups/ssl/{{ _req_id }}_{{ ansible_date_time.epoch }}"
+    _stage_root:  "/tmp/ssl-enable-staging-{{ _req_id }}-{{ ansible_date_time.epoch }}"
 
     # Preflight facts from Play 1
     _new_cert_abs:  "{{ hostvars['localhost']['_pf']['cert_abs'] }}"
@@ -441,6 +457,46 @@
         state: absent
       when: dry_run == 'true'
 
+    # ---------------------------------------------------------------------- #
+    #  Result block for the DRY-RUN exit.
+    #
+    #  This playbook previously emitted NOTHING machine-readable on any path.
+    #  The portal's preview-before-approve flow runs it with dry_run=true, so
+    #  without this the approver would be shown an empty table and asked to
+    #  approve first-time SSL setup having seen nothing at all.
+    #
+    #  MUST come BEFORE the end_host below - `meta: end_host` stops the play
+    #  for this host immediately, and post_tasks do not run after it either.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured result - dry run preview
+      ansible.builtin.debug:
+        msg: |
+          SSL_ENABLE_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'enable_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
+              'dry_run': dry_run,
+              'phase': 'preview',
+              'server_name': _effective_server_name | trim,
+              'ssl_port': _ssl_port,
+              'document_root': _document_root,
+              'cert_path': _cert_dest,
+              'key_path': _key_dest,
+              'chain_path': _chain_provided | ternary(_chain_dest, ''),
+              'config_file': _config_dest,
+              'new_fingerprint': _new_fp,
+              'new_expiry': hostvars['localhost']['_pf']['new_expiry'],
+              'backup_dir': _backup_root,
+              'rollback_available': false,
+              'status': 'preview'
+            } | to_json
+          }}
+          SSL_ENABLE_RESULT_END
+      when: dry_run == 'true'
+
     - name: DRY-RUN end
       ansible.builtin.meta: end_host
       when: dry_run == 'true'
@@ -649,3 +705,40 @@
           - "Backup dir:      {{ _backup_root }}"
           - "Rollback cmd:    bash {{ _backup_root }}/restore.sh"
           - "==================================================="
+
+    # ---------------------------------------------------------------------- #
+    #  Result block for the successful-execute path.
+    #
+    #  The human-readable debug above is for someone reading the Semaphore log.
+    #  This block is for the portal, which needs one JSON object per host to
+    #  build its per-server results table. Unrecognised or absent output must
+    #  never be presented as a successful empty result.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured JSON result
+      ansible.builtin.debug:
+        msg: |
+          SSL_ENABLE_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'enable_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
+              'dry_run': dry_run,
+              'phase': 'execute',
+              'server_name': _effective_server_name | trim,
+              'ssl_port': _ssl_port,
+              'document_root': _document_root,
+              'cert_path': _cert_dest,
+              'key_path': _key_dest,
+              'chain_path': _chain_provided | ternary(_chain_dest, ''),
+              'config_file': _config_dest,
+              'new_fingerprint': _new_fp,
+              'new_expiry': hostvars['localhost']['_pf']['new_expiry'],
+              'backup_dir': _backup_root,
+              'rollback_available': true,
+              'rollback_command': 'bash ' ~ _backup_root ~ '/restore.sh',
+              'status': 'success'
+            } | to_json
+          }}
+          SSL_ENABLE_RESULT_END

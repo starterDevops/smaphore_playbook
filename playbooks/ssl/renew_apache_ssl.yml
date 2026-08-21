@@ -218,8 +218,29 @@
     - ../group_vars/all/vault.yml
 
   vars:
-    _backup_root: "/var/backups/ssl/{{ request_id }}_{{ ansible_date_time.epoch }}"
-    _stage_root:  "/tmp/ssl-renewal-staging-{{ request_id }}-{{ ansible_date_time.epoch }}"
+    # ---------------------------------------------------------------------- #
+    #  Normalised identifiers (fixes PLAYBOOK_FINDINGS P-03)
+    #
+    #  `set_fact` is HOST-SCOPED. Play 1 runs on localhost and trims these
+    #  values there, but this play runs on the target hosts, which never saw
+    #  that fact. A bare {{ request_id }} here therefore resolves back to the
+    #  RAW survey value, untrimmed.
+    #
+    #  A survey value of "abc123 " then produces a backup directory called
+    #  "/var/backups/ssl/abc123 _1754..." - with a space in it. The deploy
+    #  still succeeds, so nothing looks wrong; the failure surfaces later when
+    #  restore.sh is run from an unquoted context, or when the portal tries to
+    #  match the backup_path it recorded. That is the worst possible moment to
+    #  discover it.
+    #
+    #  Prefer the normalised value from localhost, fall back to the raw one,
+    #  and trim either way.
+    # ---------------------------------------------------------------------- #
+    _req_id: "{{ (hostvars['localhost']['request_id'] | default(request_id, true)) | trim }}"
+    _tkt_id: "{{ (hostvars['localhost']['ticket_id']  | default(ticket_id,  true)) | trim }}"
+
+    _backup_root: "/var/backups/ssl/{{ _req_id }}_{{ ansible_date_time.epoch }}"
+    _stage_root:  "/tmp/ssl-renewal-staging-{{ _req_id }}-{{ ansible_date_time.epoch }}"
     _new_cert_abs: "{{ hostvars['localhost']['_pf']['cert_abs'] }}"
     _new_key_abs:  "{{ hostvars['localhost']['_pf']['key_abs'] }}"
     _new_chain_abs: "{{ hostvars['localhost']['_pf']['chain_abs'] }}"
@@ -358,6 +379,40 @@
     - name: Determine which VHosts to deploy to
       ansible.builtin.set_fact:
         _deploy_targets: "{{ _to_deploy | selectattr('will_deploy') | list }}"
+
+    # ---------------------------------------------------------------------- #
+    #  Result block for the "nothing to deploy" exit.
+    #
+    #  MUST come BEFORE the end_host below. `meta: end_host` stops the play for
+    #  this host immediately - no later task runs, and post_tasks do not run
+    #  either. Without this, a host that was correctly skipped emits nothing at
+    #  all, and the portal cannot distinguish "already correct, nothing needed
+    #  doing" from "this host never ran". Those mean opposite things to an
+    #  approver, so silence is not acceptable for either.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured result - nothing to deploy
+      ansible.builtin.debug:
+        msg: |
+          SSL_RENEWAL_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'renew_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
+              'dry_run': dry_run,
+              'phase': (dry_run == 'true') | ternary('preview', 'execute'),
+              'vhosts_updated': 0,
+              'vhosts_skipped': _to_deploy | length,
+              'skip_reasons': _to_deploy | map(attribute='skip_reason') | list,
+              'new_fingerprint': _new_fp,
+              'backup_dir': '',
+              'rollback_available': false,
+              'status': 'already_correct'
+            } | to_json
+          }}
+          SSL_RENEWAL_RESULT_END
+      when: _deploy_targets | length == 0
 
     - name: Skip host if nothing to deploy
       ansible.builtin.meta: end_host
@@ -520,6 +575,46 @@
       ansible.builtin.file:
         path: "{{ _stage_root }}"
         state: absent
+      when: dry_run == 'true'
+
+    # ---------------------------------------------------------------------- #
+    #  Result block for the DRY-RUN exit.
+    #
+    #  This is the single most important emission in the playbook. The portal's
+    #  preview-before-approve flow runs this playbook with dry_run=true and
+    #  shows the approver what WOULD change. Before this block existed, a dry
+    #  run produced no parseable output at all - so the approval email would
+    #  have presented an empty table, and an approver would have been asked to
+    #  approve a change having been shown nothing.
+    #
+    #  Again: BEFORE the end_host, or it never runs.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured result - dry run preview
+      ansible.builtin.debug:
+        msg: |
+          SSL_RENEWAL_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'renew_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
+              'dry_run': dry_run,
+              'phase': 'preview',
+              'vhosts_to_update': _deploy_targets | length,
+              'vhosts_skipped': _to_deploy | rejectattr('will_deploy') | list | length,
+              'skip_reasons': _to_deploy | rejectattr('will_deploy') | map(attribute='skip_reason') | list,
+              'target_vhosts': _deploy_targets | map(attribute='cert_path') | list,
+              'target_server_names': _deploy_targets | map(attribute='server_names') | list,
+              'current_fingerprints': _deploy_targets | map(attribute='current_fp') | list,
+              'new_fingerprint': _new_fp,
+              'new_expiry': hostvars['localhost']['_pf']['new_expiry'],
+              'backup_dir': _backup_root,
+              'rollback_available': false,
+              'status': 'preview'
+            } | to_json
+          }}
+          SSL_RENEWAL_RESULT_END
       when: dry_run == 'true'
 
     - name: DRY-RUN end
@@ -693,15 +788,21 @@
           {{
             {
               'host': inventory_hostname,
-              'ticket_id': ticket_id,
-              'request_id': request_id,
+              'playbook': 'renew_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
               'dry_run': dry_run,
+              'phase': 'execute',
               'vhosts_updated': _deploy_targets | length,
               'vhosts_skipped': _to_deploy | rejectattr('will_deploy') | list | length,
               'skip_reasons': _to_deploy | rejectattr('will_deploy') | map(attribute='skip_reason') | list,
+              'target_vhosts': _deploy_targets | map(attribute='cert_path') | list,
+              'target_server_names': _deploy_targets | map(attribute='server_names') | list,
               'new_fingerprint': _new_fp,
               'new_expiry': hostvars['localhost']['_pf']['new_expiry'],
               'backup_dir': _backup_root,
+              'rollback_available': true,
+              'rollback_command': 'bash ' ~ _backup_root ~ '/restore.sh',
               'status': 'success'
             } | to_json
           }}
