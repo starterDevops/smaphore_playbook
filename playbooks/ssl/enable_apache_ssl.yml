@@ -109,11 +109,13 @@
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout"
       register: _cert_pem_check
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Validate key is PEM format
       ansible.builtin.command: "openssl pkey -in {{ _key_abs }} -noout"
       register: _key_pem_check
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Extract cert public key hash
       ansible.builtin.shell:
@@ -121,6 +123,7 @@
         executable: /bin/bash
       register: _cert_pub_hash
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Extract key public key hash
       ansible.builtin.shell:
@@ -128,12 +131,33 @@
         executable: /bin/bash
       register: _key_pub_hash
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Verify cert-key match
       ansible.builtin.assert:
+        # ------------------------------------------------------------------ #
+        #  `is defined` and `length > 0` are NOT redundant here.
+        #
+        #  If the two hash tasks above are skipped - as happens when the
+        #  template is launched with Semaphore's "Dry Run" option, which passes
+        #  --check and makes command/shell tasks skip - both operands are
+        #  UNDEFINED, and Jinja2 compares two undefined values as EQUAL.
+        #
+        #  The assertion would then report success without comparing anything,
+        #  and an unvalidated certificate and key would proceed to deployment.
+        #  Observed in production on the renewal playbook, task #80.
+        # ------------------------------------------------------------------ #
         that:
-          - _cert_pub_hash.stdout == _key_pub_hash.stdout
-        fail_msg: "Certificate does not match private key."
+          - _cert_pub_hash.stdout is defined
+          - _key_pub_hash.stdout  is defined
+          - _cert_pub_hash.stdout | trim | length > 0
+          - _key_pub_hash.stdout  | trim | length > 0
+          - _cert_pub_hash.stdout | trim == _key_pub_hash.stdout | trim
+        fail_msg: >-
+          SECURITY: certificate and private key could not be confirmed as a
+          matching pair. Either they genuinely do not match, or the validation
+          commands did not run (check whether this template was launched with
+          Semaphore's "Dry Run" option, which skips command tasks). Aborting.
 
     - name: Compute new cert fingerprint
       ansible.builtin.shell:
@@ -141,11 +165,13 @@
         executable: /bin/bash
       register: _new_cert_fp
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Compute new cert expiry
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -enddate"
       register: _new_cert_expiry
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Extract new cert SANs
       ansible.builtin.shell:
@@ -155,6 +181,7 @@
         executable: /bin/bash
       register: _new_cert_sans_raw
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Build SANs list
       ansible.builtin.set_fact:

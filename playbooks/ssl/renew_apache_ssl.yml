@@ -101,16 +101,19 @@
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout"
       register: _cert_pem_check
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Validate key is PEM format
       ansible.builtin.command: "openssl pkey -in {{ _key_abs }} -noout"
       register: _key_pem_check
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Validate chain is PEM format (if provided)
       ansible.builtin.command: "openssl x509 -in {{ _chain_abs }} -noout"
       register: _chain_pem_check
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
       when: _chain_provided
 
     - name: Extract cert public key modulus hash
@@ -119,6 +122,7 @@
         executable: /bin/bash
       register: _cert_pub_hash
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Extract key public key modulus hash
       ansible.builtin.shell:
@@ -126,17 +130,45 @@
         executable: /bin/bash
       register: _key_pub_hash
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Verify cert-key match
       ansible.builtin.assert:
+        # ------------------------------------------------------------------ #
+        #  The `is defined` and `length > 0` checks are NOT redundant.
+        #
+        #  Observed in production (task #80): both hash tasks were skipped
+        #  because Semaphore ran the template with its own "Dry Run" checkbox,
+        #  which passes --check to Ansible, and command/shell tasks skip in
+        #  check mode by default. Both operands were then UNDEFINED - and
+        #  Jinja2 compares two undefined values as EQUAL.
+        #
+        #  So this assertion reported "All assertions passed" without having
+        #  compared anything, while its own failure message claims to be a
+        #  security control. An unvalidated certificate and key would have
+        #  proceeded to deployment.
+        #
+        #  check_mode: false on the hash tasks above is the primary fix. These
+        #  extra conditions are the belt-and-braces: an empty or missing hash
+        #  can never again be read as a match.
+        # ------------------------------------------------------------------ #
         that:
-          - _cert_pub_hash.stdout == _key_pub_hash.stdout
-        fail_msg: "SECURITY: Certificate does not match private key. Aborting."
+          - _cert_pub_hash.stdout is defined
+          - _key_pub_hash.stdout  is defined
+          - _cert_pub_hash.stdout | trim | length > 0
+          - _key_pub_hash.stdout  | trim | length > 0
+          - _cert_pub_hash.stdout | trim == _key_pub_hash.stdout | trim
+        fail_msg: >-
+          SECURITY: certificate and private key could not be confirmed as a
+          matching pair. Either they genuinely do not match, or the validation
+          commands did not run (check whether this template was launched with
+          Semaphore's "Dry Run" option, which skips command tasks). Aborting.
 
     - name: Verify chain validates cert (if chain provided)
       ansible.builtin.command: "openssl verify -CAfile {{ _chain_abs }} {{ _cert_abs }}"
       register: _chain_verify
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
       when: _chain_provided
 
     - name: Compute new cert fingerprint (SHA256)
@@ -145,21 +177,25 @@
         executable: /bin/bash
       register: _new_cert_fp
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Compute new cert expiry date
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -enddate"
       register: _new_cert_expiry
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Verify cert is not already expired
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -checkend 0"
       register: _cert_notexpired
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Warn if cert expires within 60 days
       ansible.builtin.command: "openssl x509 -in {{ _cert_abs }} -noout -checkend {{ 60 * 24 * 3600 }}"
       register: _cert_expires_soon
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
       failed_when: false
 
     - name: Extract new cert Subject Alternative Names (SANs)
@@ -170,6 +206,7 @@
         executable: /bin/bash
       register: _new_cert_sans_raw
       changed_when: false
+      check_mode: false   # read-only openssl; must run even under --check
 
     - name: Build SANs list
       ansible.builtin.set_fact:
@@ -306,6 +343,52 @@
     - name: Filter to only configs with SSL
       ansible.builtin.set_fact:
         _ssl_configs: "{{ _ssl_vhosts | selectattr('has_ssl') | list }}"
+
+    # ---------------------------------------------------------------------- #
+    #  Handle a host that has Apache but NO SSL configured at all.
+    #
+    #  Observed in production (task #80, streamgrw2): with no SSL vhosts,
+    #  _ssl_configs is empty, so the fingerprint, subject and enrich tasks all
+    #  loop over an empty list and skip. `_to_deploy` is built ONLY by that
+    #  enrich loop, so it is never defined - and the very next task references
+    #  it unguarded:
+    #
+    #      fatal: [streamgrw2]: '_to_deploy' is undefined
+    #
+    #  Any Apache host without SSL crashed this playbook, and crashed BEFORE
+    #  reaching any result block, so the portal received nothing at all.
+    #
+    #  This is a legitimate outcome, not an error: a renewal playbook has
+    #  nothing to renew on a host with no certificate. Report it clearly and
+    #  end the host. First-time setup is enable_apache_ssl.yml's job.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured result - no SSL configured on this host
+      ansible.builtin.debug:
+        msg: |
+          SSL_RENEWAL_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'renew_apache_ssl',
+              'ticket_id': _tkt_id,
+              'request_id': _req_id,
+              'dry_run': dry_run,
+              'phase': (dry_run == 'true') | ternary('preview', 'execute'),
+              'vhosts_updated': 0,
+              'vhosts_skipped': 0,
+              'skip_reasons': ['no SSL VirtualHost found in sites-enabled - this host has no certificate to renew. Use the SSL enable automation for first-time setup.'],
+              'configs_examined': _ssl_vhosts | default([]) | length,
+              'backup_dir': '',
+              'rollback_available': false,
+              'status': 'no_ssl'
+            } | to_json
+          }}
+          SSL_RENEWAL_RESULT_END
+      when: _ssl_configs | length == 0
+
+    - name: Skip host if it has no SSL configured
+      ansible.builtin.meta: end_host
+      when: _ssl_configs | length == 0
 
     - name: Get current cert fingerprints for each SSL config
       ansible.builtin.shell:
