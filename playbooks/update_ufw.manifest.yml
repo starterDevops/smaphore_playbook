@@ -1,0 +1,190 @@
+---
+# =============================================================================
+#  update_ufw.manifest.yml
+#
+#  Describes update_ufw.yml to the Ops Portal: what it is called in plain
+#  language, what questions to ask the requester, and how those answers map to
+#  the playbook's Semaphore survey variables.
+#
+#  WHY THE MANIFEST LIVES HERE AND NOT IN THE PORTAL
+#      The obvious alternative is a form-builder in the portal UI: click to add
+#      a field, pick its type, save. It looks friendlier and it is a trap. The
+#      form would live in the portal's database while the playbook it feeds
+#      lives in Git - two halves of one contract, in two systems, with nothing
+#      keeping them in step. Someone adds a survey variable, forgets the form,
+#      and the automation breaks silently.
+#
+#      Beside the playbook, both change in the same commit and the same review.
+#
+#  A MANIFEST NEVER GOES LIVE ON ITS OWN. The portal discovers it and shows an
+#  admin "1 automation is waiting to be reviewed". An admin binds it to a real
+#  Semaphore template and grants team access before any requester can see it.
+# =============================================================================
+
+apiVersion: opsportal/v1
+kind: Automation
+
+metadata:
+  # Stable identifier. Never change it once requests reference this automation -
+  # rename the `name` instead.
+  slug: ufw-rule-add
+  # What users see. Plain language: nobody outside DevOps says "UFW".
+  name: "Open a firewall port"
+  category: firewall
+  icon: "🔥"
+  manifest_version: 1
+
+# --------------------------------------------------------------------------- #
+#  Everything a non-technical person needs to decide "is this the one I want?"
+# --------------------------------------------------------------------------- #
+catalogue:
+  summary: >
+    Lets specific computers reach specific ports on a group of servers.
+
+  what_it_does: >
+    Adds a rule to the firewall on each server in the group you choose, so that
+    traffic from the addresses you specify is allowed through on the ports you
+    specify. Existing rules are left alone.
+
+  when_to_use: >
+    When a customer or a new system needs to reach one of your servers and is
+    currently being blocked - for example onboarding a new streaming edge, or
+    giving a monitoring system access.
+
+  what_it_changes:
+    - "Adds an allow rule to the firewall on each server in the group"
+    - "Saves a copy of the firewall's current state first, so the change can be undone"
+    - "Reloads the firewall so the rule takes effect immediately"
+
+  typical_duration_minutes: 2
+  risk_level: medium
+  risk_explanation: >
+    Opening a port makes a service reachable from the addresses you list. The
+    change itself is quick and does not interrupt anything, but it widens what
+    can reach your servers - so the addresses and ports matter.
+
+# --------------------------------------------------------------------------- #
+#  How the portal runs it
+# --------------------------------------------------------------------------- #
+execution:
+  # The NAME of the Semaphore template. An admin binds this to the real numeric
+  # template ID during registration - IDs differ between environments and
+  # hard-coding one here would make the manifest untestable anywhere else.
+  semaphore_template: update_ufw
+
+  # false: the playbook targets the whole group at once.
+  serial: false
+
+  preview:
+    # update_ufw.yml has no dry-run mode, so there is nothing to preview.
+    # An approver sees the requested rule, not a simulation of applying it.
+    supported: false
+
+  # Values sent on every run, not asked of the requester.
+  static_params: {}
+
+# --------------------------------------------------------------------------- #
+#  The form. One step is one screen.
+#
+#  `maps_to` is the Semaphore survey variable name, exactly as update_ufw.yml
+#  expects it. `name` is the form field; the two differ where the playbook's
+#  vocabulary is not the user's - `comment` below is the obvious case.
+# --------------------------------------------------------------------------- #
+form:
+  steps:
+    - title: "Which servers?"
+      help: "Choose the group of servers the rule should be added to."
+      fields:
+        - name: target_group
+          label: "Server group"
+          type: host_group
+          required: true
+          maps_to: target_group
+          help: "Pick a test group first if you are unsure."
+
+    - title: "What traffic should be allowed?"
+      help: "Describe what needs to get through."
+      fields:
+        - name: subnets
+          label: "Allow traffic from"
+          type: cidr_list
+          required: true
+          maps_to: subnets
+          placeholder: "10.0.0.0/24, 192.168.5.32/32"
+          help: >
+            One or more addresses, separated by commas. Use /32 for a single
+            computer.
+
+        - name: ports
+          label: "On these ports"
+          type: port_list
+          required: true
+          maps_to: ports
+          placeholder: "80, 443, 8443"
+          help: "Separate multiple ports with commas."
+
+        - name: protocol
+          label: "Protocol"
+          type: select
+          required: true
+          maps_to: protocol
+          default: tcp
+          options:
+            - value: tcp
+              label: "TCP - most services, including web traffic"
+            - value: udp
+              label: "UDP - streaming, DNS, some video protocols"
+
+    - title: "Why do you need this?"
+      help: "Your approver will read this before deciding."
+      fields:
+        - name: ticket_id
+          label: "Ticket number"
+          type: text
+          required: false
+          maps_to: ticket_id
+          pattern: "^[A-Za-z0-9._-]{0,50}$"
+          placeholder: "INC1234"
+          help: "Leave blank if there is no ticket."
+
+        - name: justification
+          label: "Reason for this request"
+          type: textarea
+          required: true
+          min_length: 10
+          # The playbook calls this `comment` and writes it into the firewall
+          # rule as a tag. The requester should not have to know that.
+          maps_to: comment
+          placeholder: "Customer ACME onboarding a new streaming edge."
+
+# --------------------------------------------------------------------------- #
+#  Approval
+# --------------------------------------------------------------------------- #
+approval:
+  # Always true. The schema rejects false - an automation that can reach
+  # production without a second person is not something this portal offers.
+  required: true
+  approvers: approvers
+  min_approvals: 1
+  link_expiry_hours: 24
+  require_login_for_high_risk: true
+
+# --------------------------------------------------------------------------- #
+#  Rollback
+# --------------------------------------------------------------------------- #
+rollback:
+  # The playbook saves the firewall state to /var/backups before changing it,
+  # but there is no automation to restore it - that is a manual `ufw delete`
+  # against the saved file. Claiming one-click rollback here would be a lie the
+  # portal repeats to users.
+  supported: false
+  description: >
+    The firewall's previous state is saved on each server before the change.
+    Undoing it is currently a manual step for the platform team.
+
+notifications:
+  on_submit: [requester]
+  on_approve: [requester]
+  on_reject: [requester]
+  on_success: [requester, approver]
+  on_failure: [requester, approver, platform_admins]
