@@ -98,7 +98,7 @@ all:
 
     test:
       hosts:
-        livestream5:
+        Customer_streaming:
 
     All_VOD_Servers:
       children:
