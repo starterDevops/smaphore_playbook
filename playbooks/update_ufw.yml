@@ -18,6 +18,13 @@
   become: true
   gather_facts: true
 
+  vars:
+    # Single definition of the backup path so the file that is written and the
+    # path reported to the portal can never drift apart. Evaluated lazily, so
+    # ticket_id being set in pre_tasks is fine; ansible_date_time is gathered
+    # once per run and is therefore stable across both uses.
+    _ufw_backup_file: "/var/backups/ufw_{{ ansible_date_time.iso8601_basic_short }}_{{ ticket_id }}.txt"
+
   # Fail fast if any required variable was not supplied
   pre_tasks:
     - name: Trim whitespace from all inputs
@@ -85,7 +92,7 @@
 
     - name: Write pre-change UFW backup
       ansible.builtin.copy:
-        dest: "/var/backups/ufw_{{ ansible_date_time.iso8601_basic_short }}_{{ ticket_id }}.txt"
+        dest: "{{ _ufw_backup_file }}"
         content: |
           # UFW state BEFORE ticket {{ ticket_id }} at {{ ansible_date_time.iso8601 }}
           # Host: {{ inventory_hostname }}
@@ -134,3 +141,62 @@
           ports: "{{ port_list }}"
           protocol: "{{ protocol }}"
           rules_after: "{{ ufw_after.stdout_lines }}"
+
+    # ---------------------------------------------------------------------- #
+    #  Structured result for the portal.  See RESULT_CONTRACT.md.
+    #
+    #  The debug above is for a human reading the Semaphore log. This block is
+    #  the machine contract: one JSON object per host, which the portal turns
+    #  into "livestream5: 3 firewall rules added" rather than making a
+    #  non-technical requester read Ansible output.
+    #
+    #  This playbook has NO meta:end_host, so post_tasks always run and a
+    #  single emission here covers every path. Playbooks that DO exit early
+    #  must emit before each end_host - see rule 1 of the contract.
+    #
+    #  `already_correct` when nothing changed is not a technicality: re-running
+    #  a request that was already applied is a normal, successful outcome, and
+    #  the user should be told "nothing needed doing" rather than "success"
+    #  with no explanation of why nothing appears different.
+    # ---------------------------------------------------------------------- #
+    - name: Emit structured result for the portal
+      ansible.builtin.debug:
+        msg: |
+          OPSPORTAL_RESULT_BEGIN
+          {{
+            {
+              'host': inventory_hostname,
+              'playbook': 'update_ufw',
+              'ticket_id': ticket_id,
+              'phase': 'execute',
+              'status': ufw_result.changed | ternary('success', 'already_correct'),
+              'changed': ufw_result.changed,
+              'summary': (
+                  (_rules_added | string) + ' firewall rule' + ('' if _rules_added == 1 else 's') +
+                  ' added on port' + ('' if port_list | length == 1 else 's') + ' ' +
+                  (port_list | join(', ')) + '/' + protocol
+                ) if ufw_result.changed else (
+                  'No change needed - the requested rules were already in place.'
+                ),
+              'rules_requested': _rules_requested,
+              'rules_added': _rules_added,
+              'backup_path': _ufw_backup_file,
+              'rollback_available': true,
+              'rollback_command': 'ufw status numbered   # then: ufw delete <number>, comparing against ' ~ _ufw_backup_file,
+              'details': {
+                'subnets': subnet_list,
+                'ports': port_list,
+                'protocol': protocol,
+                'target_group': target_group,
+                'comment': comment,
+                'rules_after': ufw_after.stdout_lines
+              }
+            } | to_json
+          }}
+          OPSPORTAL_RESULT_END
+      vars:
+        # The loop is a cross-product of subnets and ports, so one "rule" is one
+        # (subnet, port) pair. `changed` on the whole task is true if ANY pair
+        # was new; these counts say how many.
+        _rules_requested: "{{ subnet_list | length * port_list | length }}"
+        _rules_added: "{{ ufw_result.results | default([]) | selectattr('changed') | list | length }}"
