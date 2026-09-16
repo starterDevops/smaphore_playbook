@@ -83,6 +83,20 @@ execution:
   # Values sent on every run, not asked of the requester.
   static_params: {}
 
+  # System values the portal should supply, named explicitly.
+  #
+  # EMPTY ON PURPOSE. update_ufw.yml declares exactly six survey variables and
+  # has no use for request_id - the SSL playbooks do, because they build their
+  # upload path from it.
+  #
+  # This is a list rather than something the portal decides because Semaphore
+  # SILENTLY DISCARDS a survey variable the playbook does not declare. An
+  # unwanted extra is therefore invisible, right up until some future version
+  # of this playbook gains a variable by that name and starts receiving a value
+  # nobody meant to send. Naming them here keeps that decision next to the
+  # playbook it applies to.
+  inject: []
+
 # --------------------------------------------------------------------------- #
 #  The form. One step is one screen.
 #
