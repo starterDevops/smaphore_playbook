@@ -124,10 +124,11 @@ form:
           type: cidr_list
           required: true
           maps_to: subnets
-          placeholder: "10.0.0.0/24, 192.168.5.32/32"
+          placeholder: "10.0.0.0/24, 192.168.5.32, fd00::/32"
           help: >
-            One or more addresses, separated by commas. Use /32 for a single
-            computer.
+            One or more addresses, separated by commas. IPv4 and IPv6 are both
+            accepted, and you can mix them. A plain address without a slash
+            means that one computer only.
 
         - name: ports
           label: "On these ports"
