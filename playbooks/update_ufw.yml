@@ -60,6 +60,22 @@
         subnet_list: "{{ subnets.split(',') | map('trim') | list }}"
         port_list:   "{{ ports.split(',')   | map('trim') | list }}"
 
+    # iptables' multiport match accepts at most 15 port specifications in one
+    # rule, and UFW builds on it. Beyond that ufw fails with an error that does
+    # not mention the limit, so catch it here with an explanation instead.
+    #
+    # If you genuinely need more than 15, split them across two requests - or
+    # use a port range, which counts as one spec.
+    - name: Refuse more than 15 ports in a single rule
+      ansible.builtin.assert:
+        that:
+          - port_list | length <= 15
+        fail_msg: >-
+          {{ port_list | length }} ports were requested, but a single firewall
+          rule can cover at most 15 (an iptables multiport limit that UFW
+          inherits). Split this into more than one request, or use a port range
+          such as 8000:8010, which counts as one.
+
     - name: Show effective inputs
       ansible.builtin.debug:
         msg:
@@ -102,14 +118,38 @@
         owner: root
         group: root
 
-    - name: Add UFW allow rules (subnet x port cross-product)
+    # ---------------------------------------------------------------------- #
+    #  One rule per subnet, covering every requested port.
+    #
+    #  Previously this looped over the CROSS-PRODUCT of subnets and ports, so
+    #  one address and four ports produced four separate rules:
+    #
+    #      3030/tcp   ALLOW   fd00::/32
+    #      554/tcp    ALLOW   fd00::/32
+    #      1935/tcp   ALLOW   fd00::/32
+    #      8080/tcp   ALLOW   fd00::/32
+    #
+    #  UFW accepts a comma-separated port list, producing one rule instead:
+    #
+    #      554,1935,3030,8080/tcp   ALLOW   fd00::/32
+    #
+    #  This matches how the rest of the firewall is already managed by hand
+    #  (the "Customer Pools TCP" rules), keeps `ufw status` readable, and means
+    #  fewer iptables rules to traverse per packet.
+    #
+    #  The trade-off, stated plainly: removing ONE port later means deleting
+    #  the whole rule and re-adding it without that port. With a rule per port
+    #  you could delete just the one. Grouped rules are easier to read and
+    #  slightly harder to amend.
+    # ---------------------------------------------------------------------- #
+    - name: Add UFW allow rules (one rule per subnet, all ports together)
       community.general.ufw:
         rule: allow
-        from_ip: "{{ item.0 }}"
-        to_port: "{{ item.1 }}"
+        from_ip: "{{ item }}"
+        to_port: "{{ port_list | join(',') }}"
         proto: "{{ protocol }}"
         comment: "ticket:{{ ticket_id }} {{ comment | truncate(60, True, '') }}"
-      loop: "{{ subnet_list | product(port_list) | list }}"
+      loop: "{{ subnet_list }}"
       register: ufw_result
 
     - name: Ensure UFW is enabled (does nothing if already enabled)
@@ -173,13 +213,17 @@
               'changed': ufw_result.changed,
               'summary': (
                   (_rules_added | string) + ' firewall rule' + ('' if _rules_added == 1 else 's') +
-                  ' added on port' + ('' if port_list | length == 1 else 's') + ' ' +
+                  ' added, allowing ' + (subnet_list | join(', ')) +
+                  ' on port' + ('' if port_list | length == 1 else 's') + ' ' +
                   (port_list | join(', ')) + '/' + protocol
                 ) if ufw_result.changed else (
                   'No change needed - the requested rules were already in place.'
                 ),
+              # One rule per source address now, each covering every port -
+              # not one per subnet-and-port pair as before.
               'rules_requested': _rules_requested,
               'rules_added': _rules_added,
+              'ports_per_rule': port_list | length,
               'backup_path': _ufw_backup_file,
               'rollback_available': true,
               'rollback_command': 'ufw status numbered   # then: ufw delete <number>, comparing against ' ~ _ufw_backup_file,
