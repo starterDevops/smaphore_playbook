@@ -199,48 +199,54 @@
     #  the user should be told "nothing needed doing" rather than "success"
     #  with no explanation of why nothing appears different.
     # ---------------------------------------------------------------------- #
+    # Built with set_fact rather than as one large inline expression.
+    #
+    # The inline version - a multi-line {{ { ... } | to_json }} inside a block
+    # scalar - was emitted as literal template source instead of being
+    # evaluated, so the portal received Jinja rather than JSON. A YAML mapping
+    # here is templated key by key, which is both more reliable and far easier
+    # to read when one value is wrong.
+    - name: Build the structured result
+      ansible.builtin.set_fact:
+        _result:
+          host: "{{ inventory_hostname }}"
+          playbook: update_ufw
+          ticket_id: "{{ ticket_id }}"
+          phase: execute
+          status: "{{ 'success' if ufw_result.changed else 'already_correct' }}"
+          changed: "{{ ufw_result.changed }}"
+          summary: >-
+            {% if ufw_result.changed %}
+            {{ _rules_added }} firewall rule{{ '' if _rules_added | int == 1 else 's' }}
+            added, allowing {{ subnet_list | join(', ') }}
+            on port{{ '' if port_list | length == 1 else 's' }}
+            {{ port_list | join(', ') }}/{{ protocol }}
+            {% else %}
+            No change needed - the requested rules were already in place.
+            {% endif %}
+          # One rule per source address now, each covering every port - not one
+          # per subnet-and-port pair as before.
+          rules_requested: "{{ subnet_list | length }}"
+          rules_added: "{{ _rules_added }}"
+          ports_per_rule: "{{ port_list | length }}"
+          backup_path: "{{ _ufw_backup_file }}"
+          rollback_available: true
+          rollback_command: "ufw status numbered   # then: ufw delete <number>, comparing against {{ _ufw_backup_file }}"
+          details:
+            subnets: "{{ subnet_list }}"
+            ports: "{{ port_list }}"
+            protocol: "{{ protocol }}"
+            target_group: "{{ target_group }}"
+            comment: "{{ comment }}"
+            rules_after: "{{ ufw_after.stdout_lines }}"
+      vars:
+        # `changed` on the whole task is true if ANY rule was new; this counts
+        # how many of the per-subnet results actually changed something.
+        _rules_added: "{{ ufw_result.results | default([]) | selectattr('changed') | list | length }}"
+
     - name: Emit structured result for the portal
       ansible.builtin.debug:
         msg: |
           OPSPORTAL_RESULT_BEGIN
-          {{
-            {
-              'host': inventory_hostname,
-              'playbook': 'update_ufw',
-              'ticket_id': ticket_id,
-              'phase': 'execute',
-              'status': ufw_result.changed | ternary('success', 'already_correct'),
-              'changed': ufw_result.changed,
-              'summary': (
-                  (_rules_added | string) + ' firewall rule' + ('' if _rules_added == 1 else 's') +
-                  ' added, allowing ' + (subnet_list | join(', ')) +
-                  ' on port' + ('' if port_list | length == 1 else 's') + ' ' +
-                  (port_list | join(', ')) + '/' + protocol
-                ) if ufw_result.changed else (
-                  'No change needed - the requested rules were already in place.'
-                ),
-              # One rule per source address now, each covering every port -
-              # not one per subnet-and-port pair as before.
-              'rules_requested': _rules_requested,
-              'rules_added': _rules_added,
-              'ports_per_rule': port_list | length,
-              'backup_path': _ufw_backup_file,
-              'rollback_available': true,
-              'rollback_command': 'ufw status numbered   # then: ufw delete <number>, comparing against ' ~ _ufw_backup_file,
-              'details': {
-                'subnets': subnet_list,
-                'ports': port_list,
-                'protocol': protocol,
-                'target_group': target_group,
-                'comment': comment,
-                'rules_after': ufw_after.stdout_lines
-              }
-            } | to_json
-          }}
+          {{ _result | to_json }}
           OPSPORTAL_RESULT_END
-      vars:
-        # The loop is a cross-product of subnets and ports, so one "rule" is one
-        # (subnet, port) pair. `changed` on the whole task is true if ANY pair
-        # was new; these counts say how many.
-        _rules_requested: "{{ subnet_list | length * port_list | length }}"
-        _rules_added: "{{ ufw_result.results | default([]) | selectattr('changed') | list | length }}"
